@@ -42,21 +42,6 @@ diff -ruNx .git -x build -x po kwin-5.15.5/client.h kwin/client.h
      void addDamage(const QRegion &damage) override;
      bool belongsToSameApplication(const AbstractClient *other, SameApplicationChecks checks) const override;
      void doSetActive() override;
-diff -ruNx .git -x build -x po kwin-5.15.5/CMakeLists.txt kwin/CMakeLists.txt
---- kwin-5.15.5/CMakeLists.txt	2019-05-07 04:57:30.000000000 -0500
-+++ kwin/CMakeLists.txt	2019-05-07 10:53:02.846666258 -0500
-@@ -726,11 +726,3 @@
-     INSTALL_DESTINATION ${CMAKECONFIG_INSTALL_DIR})
- install(FILES ${CMAKE_CURRENT_BINARY_DIR}/KWinDBusInterfaceConfig.cmake
-     DESTINATION ${CMAKECONFIG_INSTALL_DIR})
--
--find_package(KF5I18n CONFIG REQUIRED)
--ki18n_install(po)
--
--  find_package(KF5DocTools CONFIG)
--  if(KF5DocTools_FOUND)
--    kdoctools_install(po)
--  endif()
 diff -ruNx .git -x build -x po kwin-5.15.5/composite.cpp kwin/composite.cpp
 --- kwin-5.15.5/composite.cpp	2019-05-07 04:55:42.000000000 -0500
 +++ kwin/composite.cpp	2019-05-07 02:13:43.749898768 -0500
