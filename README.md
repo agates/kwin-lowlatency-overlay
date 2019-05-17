@@ -2,6 +2,8 @@
 
 This repository provides gentoo ebuilds for the [kwin-lowlatency](https://github.com/tildearrow/kwin-lowlatency) project.
 
+Pull requests are welcome and encouraged.  I merely created this for my own convenience.
+
 # How to use this overlay
 
 ## with local overlays
