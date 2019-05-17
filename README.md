@@ -31,7 +31,7 @@ kde-plasma/kwin lowlatency
 
 Without this flag, the package is identical to the original `kde-plasma/kwin` package.
 
-# Install/update the package
+## Install/update the package
 
 Update the package with the new use flag:
 
