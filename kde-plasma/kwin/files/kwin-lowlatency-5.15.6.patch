@@ -74,18 +74,6 @@ diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/CMakeLists.txt kwin/CMakeLi
  if (NOT Qt5Test_FOUND)
      set(BUILD_TESTING OFF CACHE BOOL "Build the testing tree.")
  endif()
-@@ -726,11 +728,3 @@
-     INSTALL_DESTINATION ${CMAKECONFIG_INSTALL_DIR})
- install(FILES ${CMAKE_CURRENT_BINARY_DIR}/KWinDBusInterfaceConfig.cmake
-     DESTINATION ${CMAKECONFIG_INSTALL_DIR})
--
--find_package(KF5I18n CONFIG REQUIRED)
--ki18n_install(po)
--
--  find_package(KF5DocTools CONFIG)
--  if(KF5DocTools_FOUND)
--    kdoctools_install(po)
--  endif()
 diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/composite.cpp kwin/composite.cpp
 --- kwin-5.15.5/composite.cpp	2019-05-07 04:55:42.000000000 -0500
 +++ kwin/composite.cpp	2019-05-23 14:04:04.356200607 -0500
