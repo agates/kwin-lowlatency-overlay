@@ -1,0 +1,4128 @@
+diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/autotests/CMakeLists.txt kwin/autotests/CMakeLists.txt
+--- kwin-5.15.5/autotests/CMakeLists.txt	2019-05-07 04:55:42.000000000 -0500
++++ kwin/autotests/CMakeLists.txt	2019-05-19 13:42:10.772867908 -0500
+@@ -170,6 +170,7 @@
+ qt5_add_dbus_adaptor( testScriptedEffectLoader_SRCS ${CMAKE_CURRENT_SOURCE_DIR}/../org.kde.kwin.OrientationSensor.xml ${CMAKE_CURRENT_SOURCE_DIR}/../orientation_sensor.h KWin::OrientationSensor)
+ add_executable( testScriptedEffectLoader ${testScriptedEffectLoader_SRCS})
+ 
++target_compile_definitions(testScriptedEffectLoader PUBLIC KWINLL_NO_OPTIONS)
+ target_link_libraries(testScriptedEffectLoader
+     Qt5::Concurrent
+     Qt5::Qml
+diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/client.cpp kwin/client.cpp
+--- kwin-5.15.5/client.cpp	2019-05-07 04:55:42.000000000 -0500
++++ kwin/client.cpp	2019-05-19 13:42:10.876201237 -0500
+@@ -959,6 +959,9 @@
+         m_decoInputExtent.map();
+         updateHiddenPreview();
+     }
++    if (Compositor::isCreated()) {
++        Compositor::self()->checkUnredirect();
++    }
+     emit windowShown(this);
+ }
+ 
+@@ -974,6 +977,9 @@
+         updateHiddenPreview();
+     addWorkspaceRepaint(visibleRect());
+     workspace()->clientHidden(this);
++    if (Compositor::isCreated()) {
++        Compositor::self()->checkUnredirect();
++    }
+     emit windowHidden(this);
+ }
+ 
+@@ -992,6 +998,9 @@
+     updateHiddenPreview();
+     addWorkspaceRepaint(visibleRect());
+     workspace()->clientHidden(this);
++    if (Compositor::isCreated()) {
++        Compositor::self()->checkUnredirect();
++    }
+ }
+ 
+ /**
+diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/client.h kwin/client.h
+--- kwin-5.15.5/client.h	2019-05-07 04:55:42.000000000 -0500
++++ kwin/client.h	2019-05-19 13:42:10.876201237 -0500
+@@ -349,6 +349,7 @@
+ 
+ protected:
+     virtual void debug(QDebug& stream) const;
++    virtual bool shouldUnredirect() const;
+     void addDamage(const QRegion &damage) override;
+     bool belongsToSameApplication(const AbstractClient *other, SameApplicationChecks checks) const override;
+     void doSetActive() override;
+diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/CMakeLists.txt kwin/CMakeLists.txt
+--- kwin-5.15.5/CMakeLists.txt	2019-05-07 04:57:30.000000000 -0500
++++ kwin/CMakeLists.txt	2019-06-12 14:39:30.169544182 -0500
+@@ -1,7 +1,7 @@
+ cmake_minimum_required(VERSION 3.1 FATAL_ERROR)
+ 
+ project(KWIN)
+-set(PROJECT_VERSION "5.15.5")
++set(PROJECT_VERSION "5.15.6")
+ set(PROJECT_VERSION_MAJOR 5)
+ 
+ set(QT_MIN_VERSION "5.11.0")
+@@ -37,6 +37,7 @@
+          TYPE OPTIONAL
+          )
+ add_feature_info("Qt5Test" Qt5Test_FOUND "Required for building tests")
++
+ if (NOT Qt5Test_FOUND)
+     set(BUILD_TESTING OFF CACHE BOOL "Build the testing tree.")
+ endif()
+diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/composite.cpp kwin/composite.cpp
+--- kwin-5.15.5/composite.cpp	2019-05-07 04:55:42.000000000 -0500
++++ kwin/composite.cpp	2019-05-19 13:42:10.919534569 -0500
+@@ -60,6 +60,12 @@
+ 
+ #include <xcb/composite.h>
+ #include <xcb/damage.h>
++#include <fcntl.h>
++#include <unistd.h>
++#include <sys/ioctl.h>
++#include <libdrm/drm.h>
++
++#include <sys/stat.h>
+ 
+ Q_DECLARE_METATYPE(KWin::Compositor::SuspendReason)
+ 
+@@ -90,16 +96,21 @@
+     , vBlankInterval(0)
+     , fpsInterval(0)
+     , m_xrrRefreshRate(0)
++    , forceUnredirectCheck(false)
+     , m_finishing(false)
+     , m_starting(false)
+     , m_timeSinceLastVBlank(0)
+     , m_scene(NULL)
+     , m_bufferSwapPending(false)
+     , m_composeAtSwapCompletion(false)
++    , m_idle(false)
+ {
+     qRegisterMetaType<Compositor::SuspendReason>("Compositor::SuspendReason");
++    connect(&unredirectTimer, SIGNAL(timeout()), SLOT(delayedCheckUnredirect()));
+     connect(&compositeResetTimer, SIGNAL(timeout()), SLOT(restart()));
+     connect(options, &Options::configChanged, this, &Compositor::slotConfigChanged);
++    connect(options, SIGNAL(unredirectFullscreenChanged()), SLOT(delayedCheckUnredirect()));
++    unredirectTimer.setSingleShot(true);
+     compositeResetTimer.setSingleShot(true);
+     nextPaintReference.invalidate(); // Initialize the timer
+ 
+@@ -724,6 +735,7 @@
+         m_scene->idle();
+         m_timeSinceLastVBlank = fpsInterval - (options->vBlankTime() + 1); // means "start now"
+         m_timeSinceStart += m_timeSinceLastVBlank;
++        m_idle=true;
+         // Note: It would seem here we should undo suspended unredirect, but when scenes need
+         // it for some reason, e.g. transformations or translucency, the next pass that does not
+         // need this anymore and paints normally will also reset the suspended unredirect.
+@@ -784,6 +796,14 @@
+     if (m_bufferSwapPending && m_scene->syncsToVBlank()) {
+         m_composeAtSwapCompletion = true;
+     } else {
++        if (m_idle) {
++          m_idle=false;
++          m_totalSkips--;
++          if (m_totalSkips<0) m_totalSkips=0;
++          // TODO: improve this thing
++          m_lastPaintFree=2000;
++        }
++        usleep(m_lastPaintFree);
+         scheduleRepaint();
+     }
+ }
+@@ -897,6 +917,59 @@
+             waitTime = 1; // ... "0" would be sufficient, but the compositor isn't the WMs only task
+         }
+     }
++    //printf("waitTime: %d\n",waitTime);
++    if (waitTime<4) waitTime=4;
++    m_totalSkips-=0.004;
++    if (m_totalSkips<0) {
++      m_totalSkips=0;
++    }
++    if ((signed)(m_lastPaintFree-2000)>(signed)((waitTime*1000)-4000)) {
++      m_totalSkips++;
++      switch (options->latencyControl()) {
++        case 0: // favor responsive
++          m_lastPaintFree=(waitTime*1000)-4000;
++          break;
++        case 2: // favor low-latency
++          m_lastPaintFree-=500;
++          break;
++        case 3: // aggressive
++          m_lastPaintFree-=300;
++          break;
++        case 1: default: // balanced
++          m_lastPaintFree-=500;
++          break;
++      }
++      //printf("\x1b[1;31mstutter\x1b[m\n");
++    } else {
++      switch (options->latencyControl()) {
++        case 0: // favor responsive
++          m_lastPaintFree=fmin((waitTime*1000)-4000,m_lastPaintFree+(50-m_totalSkips*5));
++          break;
++        case 2: // favor low-latency
++          m_lastPaintFree=fmin((waitTime*1000)-4000,m_lastPaintFree+(500-m_totalSkips*30));
++          break;
++        case 3: // aggressive
++          m_lastPaintFree=fmin((waitTime*1000)-4000,m_lastPaintFree+(1000-m_totalSkips*30));
++          break;
++        case 1: default: // balanced
++          m_lastPaintFree=fmin((waitTime*1000)-4000,m_lastPaintFree+(200-m_totalSkips*20));
++          break;
++      }
++    }
++    if (m_lastPaintFree<options->minLatency()*1000) {
++      m_lastPaintFree=options->minLatency()*1000;
++    }
++    if (m_lastPaintFree<1) {
++      m_lastPaintFree=1;
++    }
++    if (m_lastPaintFree>options->maxLatency()*1000) {
++      m_lastPaintFree=options->maxLatency()*1000;
++    }
++    if (m_totalSkips>10) {
++      m_totalSkips=10;
++    }
++    //printf("LPF: %d ts: %.2f\n",m_lastPaintFree,m_totalSkips);
++    waitTime=0;
+     compositeTimer.start(qMin(waitTime, 250u), this); // force 4fps minimum
+ }
+ 
+@@ -905,6 +978,54 @@
+     return !m_finishing && hasScene();
+ }
+ 
++void Compositor::checkUnredirect()
++{
++    checkUnredirect(false);
++}
++
++// force is needed when the list of windows changes (e.g. a window goes away)
++void Compositor::checkUnredirect(bool force)
++{
++    if (!hasScene() || !m_scene->overlayWindow() || m_scene->overlayWindow()->window() == None || !options->isUnredirectFullscreen())
++        return;
++    if (force)
++        forceUnredirectCheck = true;
++    if (!unredirectTimer.isActive())
++        unredirectTimer.start(0);
++}
++
++void Compositor::delayedCheckUnredirect()
++{
++    if (!hasScene() || !m_scene->overlayWindow() || m_scene->overlayWindow()->window() == None || !(options->isUnredirectFullscreen() || sender() == options))
++        return;
++    ToplevelList list;
++    bool changed = forceUnredirectCheck;
++    foreach (Client * c, Workspace::self()->clientList())
++        list.append(c);
++    foreach (Unmanaged * c, Workspace::self()->unmanagedList())
++        list.append(c);
++    foreach (Toplevel * c, list) {
++        if (c->updateUnredirectedState()) {
++            changed = true;
++            break;
++        }
++    }
++    // no desktops, no Deleted ones
++    if (!changed)
++        return;
++    forceUnredirectCheck = false;
++    // Cut out parts from the overlay window where unredirected windows are,
++    // so that they are actually visible.
++    const QSize &s = screens()->size();
++    QRegion reg(0, 0, s.width(), s.height());
++    foreach (Toplevel * c, list) {
++        if (c->unredirected())
++            reg -= c->geometry();
++    }
++    m_scene->overlayWindow()->setShape(reg);
++    addRepaint(reg);
++}
++
+ bool Compositor::checkForOverlayWindow(WId w) const
+ {
+     if (!hasScene()) {
+@@ -958,7 +1079,9 @@
+ 
+     damage_region = QRegion(0, 0, width(), height());
+     effect_window = new EffectWindowImpl(this);
+-
++    unredirect = false;
++ 
++    Compositor::self()->checkUnredirect(true);
+     Compositor::self()->scene()->windowAdded(this);
+ 
+     // With unmanaged windows there is a race condition between the client painting the window
+@@ -975,6 +1098,7 @@
+ {
+     if (kwinApp()->operationMode() == Application::OperationModeX11 && damage_handle == XCB_NONE)
+         return;
++    Compositor::self()->checkUnredirect(true);
+     if (effect_window->window() == this) { // otherwise it's already passed to Deleted, don't free data
+         discardWindowPixmap();
+         delete effect_window;
+@@ -991,6 +1115,42 @@
+     effect_window = NULL;
+ }
+ 
++bool Toplevel::updateUnredirectedState()
++{
++    assert(compositing());
++    bool should = options->isUnredirectFullscreen() && shouldUnredirect() && !unredirectSuspend &&
++                  !shape() && !hasAlpha() && opacity() == 1.0 &&
++                  !static_cast<EffectsHandlerImpl*>(effects)->activeFullScreenEffect();
++    if (should) usleep(50000);
++    if (should == unredirect)
++        return false;
++    static QElapsedTimer lastUnredirect;
++    static const qint64 msecRedirectInterval = 100;
++    if (!lastUnredirect.hasExpired(msecRedirectInterval)) {
++        QTimer::singleShot(msecRedirectInterval, Compositor::self(), SLOT(checkUnredirect()));
++        return false;
++    }
++    lastUnredirect.start();
++    unredirect = should;
++    if (unredirect) {
++        qCDebug(KWIN_CORE) << "Unredirecting:" << this;
++        xcb_composite_unredirect_window(connection(), frameId(), XCB_COMPOSITE_REDIRECT_MANUAL);
++    } else {
++        qCDebug(KWIN_CORE) << "Redirecting:" << this;
++        xcb_composite_redirect_window(connection(), frameId(), XCB_COMPOSITE_REDIRECT_MANUAL);
++        discardWindowPixmap();
++    }
++    return true;
++}
++
++void Toplevel::suspendUnredirect(bool suspend)
++{
++    if (unredirectSuspend == suspend)
++        return;
++    unredirectSuspend = suspend;
++    Compositor::self()->checkUnredirect();
++}
++
+ void Toplevel::discardWindowPixmap()
+ {
+     addDamageFull();
+@@ -1208,4 +1368,64 @@
+     resetHaveResizeEffect();
+ }
+ 
++bool Client::shouldUnredirect() const
++{
++    if (isActiveFullScreen()) {
++        ToplevelList stacking = workspace()->xStackingOrder();
++        for (int pos = stacking.count() - 1;
++                pos >= 0;
++                --pos) {
++            Toplevel* c = stacking.at(pos);
++            if (c == this)   // is not covered by any other window, ok to unredirect
++                return true;
++            if (c->geometry().intersects(geometry()))
++                return false;
++        }
++        abort();
++    }
++    return false;
++}
++
++
++//****************************************
++// Unmanaged
++//****************************************
++
++bool Unmanaged::shouldUnredirect() const
++{
++    // the pixmap is needed for the login effect, a nicer solution would be the login effect increasing
++    // refcount for the window pixmap (which would prevent unredirect), avoiding this hack
++    if (resourceClass() == "ksplashx"
++            || resourceClass() == "ksplashsimple"
++            || resourceClass() == "ksplashqml"
++            )
++        return false;
++// it must cover whole display or one xinerama screen, and be the topmost there
++    const int desktop = VirtualDesktopManager::self()->current();
++    if (geometry() == workspace()->clientArea(FullArea, geometry().center(), desktop)
++            || geometry() == workspace()->clientArea(ScreenArea, geometry().center(), desktop)) {
++        ToplevelList stacking = workspace()->xStackingOrder();
++        for (int pos = stacking.count() - 1;
++                pos >= 0;
++                --pos) {
++            Toplevel* c = stacking.at(pos);
++            if (c == this)   // is not covered by any other window, ok to unredirect
++                return true;
++            if (c->geometry().intersects(geometry()))
++                return false;
++        }
++        abort();
++    }
++    return false;
++}
++
++//****************************************
++// Deleted
++//****************************************
++
++bool Deleted::shouldUnredirect() const
++{
++    return false;
++}
++
+ } // namespace
+diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/composite.h kwin/composite.h
+--- kwin-5.15.5/composite.h	2019-05-07 04:55:42.000000000 -0500
++++ kwin/composite.h	2019-05-19 13:42:10.919534569 -0500
+@@ -158,6 +158,8 @@
+      * Schedules a new repaint if no repaint is currently scheduled.
+      **/
+     void scheduleRepaint();
++    void checkUnredirect();
++    void checkUnredirect(bool force);
+     void updateCompositeBlocking();
+     void updateCompositeBlocking(KWin::Client* c);
+ 
+@@ -195,6 +197,7 @@
+      **/
+     void restart();
+     void performCompositing();
++    void delayedCheckUnredirect();
+     void slotConfigChanged();
+     void releaseCompositorSelection();
+     void deleteUnusedSupportProperties();
+@@ -224,6 +227,8 @@
+     QElapsedTimer nextPaintReference;
+     QRegion repaints_region;
+ 
++    QTimer unredirectTimer;
++    bool forceUnredirectCheck;
+     QTimer compositeResetTimer; // for compressing composite resets
+     bool m_finishing; // finish() sets this variable while shutting down
+     bool m_starting; // start() sets this variable while starting
+@@ -234,6 +239,11 @@
+     bool m_composeAtSwapCompletion;
+     int m_framesToTestForSafety = 3;
+ 
++    // low-latency stuff
++    int m_lastPaintFree=8000;
++    float m_totalSkips=0;
++    bool m_idle;
++
+     KWIN_SINGLETON_VARIABLE(Compositor, s_compositor)
+ };
+ }
+diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/debian/changelog kwin/debian/changelog
+--- kwin-5.15.5/debian/changelog	1969-12-31 19:00:00.000000000 -0500
++++ kwin/debian/changelog	2019-06-12 14:39:30.172877515 -0500
+@@ -0,0 +1,5 @@
++kwin (4:5.15.6-1ta1) disco; urgency=medium
++
++  * kwin-lowlatency 5.15.6
++
++ -- tildearrow <acc12345acc@gmail.com>  Thu, 23 May 2019 14:10:46 -0500
+diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/debian/compat kwin/debian/compat
+--- kwin-5.15.5/debian/compat	1969-12-31 19:00:00.000000000 -0500
++++ kwin/debian/compat	2019-06-12 14:39:30.172877515 -0500
+@@ -0,0 +1 @@
++11
+diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/debian/control kwin/debian/control
+--- kwin-5.15.5/debian/control	1969-12-31 19:00:00.000000000 -0500
++++ kwin/debian/control	2019-06-12 14:39:30.172877515 -0500
+@@ -0,0 +1,407 @@
++Source: kwin
++Section: kde
++Priority: optional
++Maintainer: tildearrow <acc12345acc@gmail.com>
++XSBC-Original-Maintainer: Debian/Kubuntu Qt/KDE Maintainers <debian-qt-kde@lists.debian.org>
++Uploaders: tildearrow <acc12345acc@gmail.com>
++Build-Depends: breeze-dev (>= 4:5.15.4~),
++               cmake (>= 3.1~),
++               debhelper (>= 11~),
++               extra-cmake-modules (>= 5.54.0~),
++               kinit-dev (>= 5.54.0~),
++               kscreenlocker-dev (>= 5.15.4~),
++               libcap-dev [linux-any],
++               libdrm-dev (>= 2.4.62~),
++               libegl1-mesa-dev (>= 1.2~),
++               libepoxy-dev (>= 1.2),
++               libfontconfig1-dev,
++               libfreetype6-dev,
++               libgbm-dev,
++               libice-dev,
++               libinput-dev (>= 1.9~),
++               libkdecorations2-dev (>= 4:5.15.4~),
++               libkf5activities-dev (>= 5.54.0~),
++               libkf5completion-dev (>= 5.54.0~),
++               libkf5config-dev (>= 5.54.0~),
++               libkf5configwidgets-dev (>= 5.54.0~),
++               libkf5coreaddons-dev (>= 5.54.0~),
++               libkf5crash-dev (>= 5.54.0~),
++               libkf5declarative-dev (>= 5.54.0~),
++               libkf5doctools-dev (>= 5.54.0~),
++               libkf5globalaccel-dev (>= 5.54.0~),
++               libkf5i18n-dev (>= 5.54.0~),
++               libkf5iconthemes-dev (>= 5.54.0~),
++               libkf5idletime-dev (>= 5.54.0~),
++               libkf5kcmutils-dev (>= 5.54.0~),
++               libkf5kio-dev (>= 5.54.0~),
++               libkf5newstuff-dev (>= 5.54.0~),
++               libkf5notifications-dev (>= 5.54.0~),
++               libkf5package-dev (>= 5.54.0~),
++               libkf5plasma-dev (>= 5.54.0~),
++               libkf5service-dev (>= 5.54.0~),
++               libkf5textwidgets-dev (>= 5.54.0~),
++               libkf5wayland-dev (>= 4:5.54.0~),
++               libkf5widgetsaddons-dev (>= 5.54.0~),
++               libkf5windowsystem-dev (>= 5.54.0~),
++               libkf5xmlgui-dev (>= 5.54.0~),
++               libqt5sensors5-dev (>= 5.9.0~),
++               libqt5x11extras5-dev (>= 5.9.0~),
++               libsm-dev,
++               libudev-dev [linux-any],
++               libwayland-dev (>= 1.2),
++               libx11-xcb-dev,
++               libxcb-composite0-dev (>= 1.10~),
++               libxcb-cursor-dev,
++               libxcb-damage0-dev (>= 1.10~),
++               libxcb-glx0-dev (>= 1.10~),
++               libxcb-icccm4-dev,
++               libxcb-image0-dev,
++               libxcb-keysyms1-dev,
++               libxcb-randr0-dev (>= 1.10~),
++               libxcb-render0-dev (>= 1.10~),
++               libxcb-shape0-dev (>= 1.10~),
++               libxcb-shm0-dev (>= 1.10~),
++               libxcb-sync-dev (>= 1.10~),
++               libxcb-xfixes0-dev (>= 1.10~),
++               libxcb-xtest0-dev,
++               libxcb1-dev (>= 1.10~),
++               libxcursor-dev,
++               libxi-dev,
++               libxkbcommon-dev (>= 0.7.0~),
++               pkg-config,
++               pkg-kde-tools (>= 0.15.18~),
++               qtbase5-dev (>= 5.9.0~),
++               qtbase5-private-dev (>= 5.7.0~),
++               qtdeclarative5-dev (>= 5.9.0~),
++               qtscript5-dev (>= 5.9.0~),
++               qttools5-dev (>= 5.9.0~),
++Standards-Version: 4.1.4
++Homepage: https://github.com/tildearrow/kwin-lowlatency
++Vcs-Browser: https://github.com/tildearrow/kwin-lowlatency
++Vcs-Git: https://github.com/tildearrow/kwin-lowlatency.git
++
++Package: kde-window-manager
++Architecture: all
++Section: oldlibs
++Priority: optional
++Depends: kwin-x11 (>= 4:5.3.2-4~), ${misc:Depends}
++Description: transitional package for kwin-x11
++ This transitional package allows one to migrate to the packages providing
++ the X11 version of the KDE window manager.
++ .
++ It can be safely removed after the installation.
++
++Package: kwin
++Architecture: all
++Multi-Arch: no
++Section: oldlibs
++Priority: optional
++Depends: kwin-x11, ${misc:Depends}
++Description: Transitional dummy for kwin-x11
++ This package is a transitional dummy to depend on the renamed kwin-x11 and
++ can be removed.
++
++Package: kwin-common
++Architecture: any
++Depends: kwin-data (= ${source:Version}),
++         libkf5globalaccel-bin,
++         libkwineffects12 (= ${binary:Version}),
++         qml-module-org-kde-kirigami2 (>= 5.54.0~),
++         qml-module-org-kde-kquickcontrolsaddons,
++         qml-module-qtmultimedia,
++         ${misc:Depends},
++         ${shlibs:Depends},
++Recommends: libqt5multimedia5-plugins, plasma-desktop (>= 4:5.14), qtvirtualkeyboard-plugin
++Suggests: kwin-addons (>= 4:5.14)
++Breaks: kwin (<= 4:5.3.1-0ubuntu3),
++Replaces: kwin (<= 4:5.3.1-0ubuntu3)
++Description: KDE window manager, common files
++ KWin (pronounced as one syllable "kwin") is the window
++ manager for the KDE Plasma Desktop. It gives you complete
++ control over your windows, making sure they're not in the way
++ but aid you in your task. It paints the window decoration,
++ the bar on top of every window with (configurable) buttons
++ like close, maximize and minimize. It also handles placing
++ of windows and switching between them.
++ .
++ This package is part of the KDE base workspace module.
++
++Package: kwin-data
++Architecture: all
++Depends: ${misc:Depends}, ${shlibs:Depends}
++Recommends: plasma-framework,
++            qml-module-qtmultimedia,
++            qml-module-qtquick-controls,
++            qml-module-qtquick-layouts,
++            qml-module-qtquick-virtualkeyboard,
++            qml-module-qtquick-window2,
++            qml-module-qtquick2,
++Breaks: ${kde-l10n:all}
++Replaces: ${kde-l10n:all}
++Description: KDE window manager data files
++ KWin (pronounced as one syllable "kwin") is the window
++ manager for the KDE Plasma Desktop. It gives you complete
++ control over your windows, making sure they're not in the way
++ but aid you in your task. It paints the window decoration,
++ the bar on top of every window with (configurable) buttons
++ like close, maximize and minimize. It also handles placing
++ of windows and switching between them.
++ .
++ This package contains the data files
++
++Package: kwin-dev
++Section: libdevel
++Architecture: any
++Depends: kwin-common (= ${binary:Version}),
++         libegl1-mesa-dev (>= 1.2~),
++         libepoxy-dev (>= 1.2),
++         libkf5config-dev (>= 5.54.0~),
++         libkf5coreaddons-dev (>= 5.54.0~),
++         libkf5windowsystem-dev (>= 5.54.0~),
++         libqt5x11extras5-dev (>= 5.9.0~),
++         qtbase5-dev (>= 5.9.0~),
++         ${misc:Depends},
++         ${shlibs:Depends},
++Breaks: kde-workspace-dev
++Replaces: kde-workspace-dev
++Description: KDE window manager - devel files
++ KWin (pronounced as one syllable "kwin") is the window
++ manager for the KDE Plasma Desktop. It gives you complete
++ control over your windows, making sure they're not in the way
++ but aid you in your task. It paints the window decoration,
++ the bar on top of every window with (configurable) buttons
++ like close, maximize and minimize. It also handles placing
++ of windows and switching between them.
++ .
++ This package is part of the KDE base workspace module.
++
++Package: kwin-wayland
++Architecture: any
++Depends: kwayland-integration (>= 5.14),
++         kwin-common (= ${binary:Version}),
++         kwin-wayland-backend-drm (= ${binary:Version}) | kwin-wayland-backend-fbdev (= ${binary:Version}) | kwin-wayland-backend-x11 (= ${binary:Version}) | kwin-wayland-backend-virtual (= ${binary:Version}) | kwin-wayland-backend-wayland (= ${binary:Version}),
++         libcap2-bin [linux-any],
++         xwayland,
++         ${misc:Depends},
++         ${shlibs:Depends},
++Provides: kwin
++Description: KDE window manager, wayland version, PREVIEW release
++ KWin (pronounced as one syllable "kwin") is the window
++ manager for the KDE Plasma Desktop. It gives you complete
++ control over your windows, making sure they're not in the way
++ but aid you in your task. It paints the window decoration,
++ the bar on top of every window with (configurable) buttons
++ like close, maximize and minimize. It also handles placing
++ of windows and switching between them.
++ .
++ This package provides the wayland version, which is still a work in progress
++ project, and is available as a PREVIEW release. Don't expect the same
++ stability as with the x11 version.
++
++Package: kwin-wayland-backend-drm
++Section: libs
++Architecture: any
++Depends: ${misc:Depends}, ${shlibs:Depends}
++Provides: kwin-wayland-backend
++Description: KDE window manager drm plugin
++ KWin (pronounced as one syllable "kwin") is the window
++ manager for the KDE Plasma Desktop. It gives you complete
++ control over your windows, making sure they're not in the way
++ but aid you in your task. It paints the window decoration,
++ the bar on top of every window with (configurable) buttons
++ like close, maximize and minimize. It also handles placing
++ of windows and switching between them.
++ .
++ This package is part of the KDE base workspace module
++
++Package: kwin-wayland-backend-fbdev
++Section: libs
++Architecture: any
++Depends: ${misc:Depends}, ${shlibs:Depends}
++Provides: kwin-wayland-backend
++Description: KDE window manager fbdev plugin
++ KWin (pronounced as one syllable "kwin") is the window
++ manager for the KDE Plasma Desktop. It gives you complete
++ control over your windows, making sure they're not in the way
++ but aid you in your task. It paints the window decoration,
++ the bar on top of every window with (configurable) buttons
++ like close, maximize and minimize. It also handles placing
++ of windows and switching between them.
++ .
++ This package is part of the KDE base workspace module
++
++Package: kwin-wayland-backend-virtual
++Section: libs
++Architecture: any
++Depends: ${misc:Depends}, ${shlibs:Depends}
++Provides: kwin-wayland-backend
++Description: KDE window manager virtual plugin
++ KWin (pronounced as one syllable "kwin") is the window
++ manager for the KDE Plasma Desktop. It gives you complete
++ control over your windows, making sure they're not in the way
++ but aid you in your task. It paints the window decoration,
++ the bar on top of every window with (configurable) buttons
++ like close, maximize and minimize. It also handles placing
++ of windows and switching between them.
++ .
++ This backend allows running kwin-wayland in headless mode, useful for testing,
++ or in the Cloud.
++
++Package: kwin-wayland-backend-wayland
++Section: libs
++Architecture: any
++Depends: ${misc:Depends}, ${shlibs:Depends}
++Provides: kwin-wayland-backend
++Description: KDE window manager nested wayland plugin
++ KWin (pronounced as one syllable "kwin") is the window
++ manager for the KDE Plasma Desktop. It gives you complete
++ control over your windows, making sure they're not in the way
++ but aid you in your task. It paints the window decoration,
++ the bar on top of every window with (configurable) buttons
++ like close, maximize and minimize. It also handles placing
++ of windows and switching between them.
++ .
++ This package is part of the KDE base workspace module
++
++Package: kwin-wayland-backend-x11
++Section: libs
++Architecture: any
++Depends: ${misc:Depends}, ${shlibs:Depends}
++Provides: kwin-wayland-backend
++Description: KDE window manager x11 plugin
++ KWin (pronounced as one syllable "kwin") is the window
++ manager for the KDE Plasma Desktop. It gives you complete
++ control over your windows, making sure they're not in the way
++ but aid you in your task. It paints the window decoration,
++ the bar on top of every window with (configurable) buttons
++ like close, maximize and minimize. It also handles placing
++ of windows and switching between them.
++ .
++ This package is part of the KDE base workspace module
++
++Package: kwin-x11
++Architecture: any
++Depends: kwin-common (= ${binary:Version}),
++         libkwinglutils12 (= ${binary:Version}),
++         libkwinxrenderutils12 (= ${binary:Version}),
++         ${misc:Depends},
++         ${shlibs:Depends},
++Breaks: kde-window-manager (<< 4:5)
++Replaces: kde-window-manager (<< 4:5)
++Provides: kwin, x-window-manager
++Description: KDE window manager, X11 version
++ KWin (pronounced as one syllable "kwin") is the window
++ manager for the KDE Plasma Desktop. It gives you complete
++ control over your windows, making sure they're not in the way
++ but aid you in your task. It paints the window decoration,
++ the bar on top of every window with (configurable) buttons
++ like close, maximize and minimize. It also handles placing
++ of windows and switching between them.
++ .
++ This package is part of the KDE base workspace module.
++
++Package: libkwin4-effect-builtins1
++Section: libs
++Architecture: any
++Depends: libkwineffects12 (= ${binary:Version}),
++         ${misc:Depends},
++         ${shlibs:Depends},
++Description: KDE window manager effect builtins library
++ KWin (pronounced as one syllable "kwin") is the window
++ manager for the KDE Plasma Desktop. It gives you complete
++ control over your windows, making sure they're not in the way
++ but aid you in your task. It paints the window decoration,
++ the bar on top of every window with (configurable) buttons
++ like close, maximize and minimize. It also handles placing
++ of windows and switching between them.
++ .
++ This package is part of the KDE base workspace module.
++
++Package: libkwineffects12
++Section: libs
++Architecture: any
++Depends: ${misc:Depends}, ${shlibs:Depends}
++Breaks: libkwineffects11,
++        libkwineffects10,
++        libkwineffects5 (<< 4:5.2.0),
++        libkwineffects6 (<< 4:5.4.1+git20150907),
++        libkwineffects7 (<< 4:5.5.80+git20160203),
++        libkwineffects8,
++        libkwineffects9,
++Replaces: libkwineffects11,
++          libkwineffects10,
++          libkwineffects5 (<< 4:5.2.0),
++          libkwineffects6 (<< 4:5.4.1+git20150907),
++          libkwineffects7 (<< 4:5.5.80+git20160203),
++          libkwineffects8,
++          libkwineffects9,
++Description: KDE window manager effects library
++ KWin (pronounced as one syllable "kwin") is the window
++ manager for the KDE Plasma Desktop. It gives you complete
++ control over your windows, making sure they're not in the way
++ but aid you in your task. It paints the window decoration,
++ the bar on top of every window with (configurable) buttons
++ like close, maximize and minimize. It also handles placing
++ of windows and switching between them.
++ .
++ This package is part of the KDE base workspace module.
++
++Package: libkwinglutils12
++Section: libs
++Architecture: any
++Depends: ${misc:Depends}, ${shlibs:Depends}
++Breaks: kwin-common (<< 4:5.4),
++        libkwin4-effect-builtins1 (<< 4:5.4),
++        libkwinglutils11,
++        libkwinglutils10,
++        libkwinglutils5 (<< 4:5.2.0),
++        libkwinglutils6 (<< 4:5.4.1+git20150907),
++        libkwinglutils7 (<< 4.5.5.80+git20160203),
++        libkwinglutils8,
++        libkwinglutils9,
++Replaces: libkwinglutils11,
++          libkwinglutils10,
++          libkwinglutils5 (<< 4:5.2.0),
++          libkwinglutils6 (<< 4:5.4.1+git20150907),
++          libkwinglutils7 (<< 4:5.5.80+git20160203),
++          libkwinglutils8,
++          libkwinglutils9,
++Description: KDE window manager gl utils library
++ KWin (pronounced as one syllable "kwin") is the window
++ manager for the KDE Plasma Desktop. It gives you complete
++ control over your windows, making sure they're not in the way
++ but aid you in your task. It paints the window decoration,
++ the bar on top of every window with (configurable) buttons
++ like close, maximize and minimize. It also handles placing
++ of windows and switching between them.
++ .
++ This package is part of the KDE base workspace module.
++
++Package: libkwinxrenderutils12
++Section: libs
++Architecture: any
++Depends: ${misc:Depends}, ${shlibs:Depends}
++Breaks: libkwinxrenderutils11,
++        libkwinxrenderutils10,
++        libkwinxrenderutils5 (<< 4:5.2.0),
++        libkwinxrenderutils6 (<< 4:5.4.1+git20150907),
++        libkwinxrenderutils7 (<< 4:5.5.80+git20160203),
++        libkwinxrenderutils8,
++        libkwinxrenderutils9,
++Replaces: libkwinxrenderutils11,
++          libkwinxrenderutils10,
++          libkwinxrenderutils5 (<< 4:5.2.0),
++          libkwinxrenderutils6 (<< 4:5.4.1+git20150907),
++          libkwinxrenderutils7 (<< 4:5.5.80+git20160203),
++          libkwinxrenderutils8,
++          libkwinxrenderutils9,
++Description: KDE window manager render utils library
++ KWin (pronounced as one syllable "kwin") is the window
++ manager for the KDE Plasma Desktop. It gives you complete
++ control over your windows, making sure they're not in the way
++ but aid you in your task. It paints the window decoration,
++ the bar on top of every window with (configurable) buttons
++ like close, maximize and minimize. It also handles placing
++ of windows and switching between them.
++ .
++ This package is part of the KDE base workspace module.
+diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/debian/copyright kwin/debian/copyright
+--- kwin-5.15.5/debian/copyright	1969-12-31 19:00:00.000000000 -0500
++++ kwin/debian/copyright	2019-06-12 14:39:30.172877515 -0500
+@@ -0,0 +1,387 @@
++Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
++Upstream-Name: kwin
++Source: git://anongit.kde.org/kwin
++
++Files: *
++Copyright: 2010, Alexandre Pereira <pereira.alex@gmail.com>
++           2013, Antonis Tsiapaliokas <kok3rs@gmail.com>
++           2011, Arthur Arlt <a.arlt@stud.uni-heidelberg.de>
++           2012, Casian Andrei <skeletk13@gmail.com>
++           2007, Christian Nitschkowski <christian.nitschkowski@kdemail.net>
++           2008, Cédric Borgese <cedric.borgese@gmail.com>
++           2012, Filip Wieladek <wattos@gmail.com>
++           2009-2014, Fredrik Höglund <fredrik@kde.org>
++           1989-1991, Free Software Foundation, Inc
++           2014, Hugo Pereira Da Costa <hugo.pereira@free.fr>
++           2010, Jorge Mata <matamax123@gmail.com>
++           2013, Kai Uwe Broulik <kde@privat.broulik.de>
++           2003, Karol Szwed <kszwed@kde.org>
++           2001-2008, Lubos Lunak <l.lunak@kde.org>
++           2008, Lubos Lunak <l.lunak@suse.cz>
++           2008-2009, Lucas Murray <lmurray@undefinedfire.com>
++           2014-2016, Marco Martin <mart@kde.org>
++           2009, Marco Martin <notmart@gmail.com>
++           2008-2011, Martin Gräßlin <kde@martin-graesslin.com>
++           2012, Martin Gräßlin <m.graesslin@kde.org>
++           2008-2016, Martin Gräßlin <mgraesslin@kde.org>
++           1998-2000, Matthias Ettrich <ettrich@kde.org>
++           2009, Michael Zanetti <michael_zanetti@gmx.net>
++           2015, Mika Allan Rauhala <mika.allan.rauhala@gmail.com>
++           2011, NVIDIA Corporation
++           2010, Nokia Corporation and/or its subsidiary(-ies)
++           1997, Patrick Dowler <dowler@morgul.fsh.uvic.ca>
++           2007, Philip Falkner <philip.falkner@gmail.com>
++           2011-2012, Philipp Knechtges <philipp-dev@knechtges.com>
++           2001, Rik Hemsley (rikkus) <rik@kde.org>
++           2006-2007, Rivo Laks <rivolaks@hot.ee>
++           2010, Rohan Prabhu <rohan@rohanprabhu.com>
++           2016, Roman Gilg <subdiff@gmail.com>
++           2003-2005, Sandro Giessl <sandro@giessl.com>
++           2010, Sebastian Sauer <sebsauer@kdab.com>
++           2011, Tamas Krutki <ktamasw@gmail.com>
++           2011-2012, The KWin team <kwin@kde.org>
++           2014-2015, Thomas Lübking <thomas.luebking@gmail.com>
++           2010-2011, Thomas Lübking <thomas.luebking@web.de>
++           2001, Waldo Bastian <bastian@kde.org>
++           2007-2014, Free Software Foundation
++           1997-2014, Free Software Foundation, Inc
++           2000, Jesús Bravo Álvarez
++           2008-2009, K Desktop Environment
++           1998, KDE Russian translation Team
++           2000-2001, KDE Team
++           2000-2002, KDE e.v
++           2007, KDE i18n Project for Vietnamese
++           1999-2002, Meni Livne <livne@kde.org>
++           2009, Rosetta Contributors and Canonical Ltd 2009
++           2010, Rosetta Contributors and Canonical Ltd 2010
++           2012, Rosetta Contributors and Canonical Ltd 2012
++           2002-2016, This_file_is_part_of_KDE
++           2001, translate.org.za
++           2019, tildearrow
++License: GPL-2+
++
++Files: po/ca/*
++       po/ca@valencia/*
++       po/uk/*
++Copyright: 1998-2016, This_file_is_part_of_KDE
++License: LGPL-2.1+3+KDEeV
++
++License: LGPL-2.1+3+KDEeV
++ This file is distributed under the license LGPL version 2.1 or
++ version 3 or later versions approved by the membership of KDE e.V.
++ --
++ On Debian systems, the complete text of the GNU Lesser General Public License
++ version 2.1 can be found in `/usr/share/common-licenses/LGPL-2.1', likewise,
++ the complete text of the GNU Lesser General Public License version 3 can be
++ found in `/usr/share/common-licenses/LGPL-3'.
++
++Files: autotests/onscreennotificationtest.cpp
++       autotests/onscreennotificationtest.h
++       kcmkwin/kwindecoration/declarative-plugin/buttonsmodel.cpp
++       kcmkwin/kwindecoration/declarative-plugin/buttonsmodel.h
++       kcmkwin/kwindecoration/declarative-plugin/plugin.cpp
++       kcmkwin/kwindecoration/declarative-plugin/plugin.h
++       kcmkwin/kwindecoration/declarative-plugin/previewbridge.cpp
++       kcmkwin/kwindecoration/declarative-plugin/previewbridge.h
++       kcmkwin/kwindecoration/declarative-plugin/previewbutton.cpp
++       kcmkwin/kwindecoration/declarative-plugin/previewbutton.h
++       kcmkwin/kwindecoration/declarative-plugin/previewclient.cpp
++       kcmkwin/kwindecoration/declarative-plugin/previewclient.h
++       kcmkwin/kwindecoration/declarative-plugin/previewitem.cpp
++       kcmkwin/kwindecoration/declarative-plugin/previewitem.h
++       kcmkwin/kwindecoration/declarative-plugin/previewsettings.cpp
++       kcmkwin/kwindecoration/declarative-plugin/previewsettings.h
++       kcmkwin/kwindecoration/decorationmodel.cpp
++       kcmkwin/kwindecoration/decorationmodel.h
++       kcmkwin/kwindecoration/kcm.cpp
++       kcmkwin/kwindecoration/kcm.h
++       kcmkwin/kwindecoration/qml/*
++       onscreennotification.cpp
++       onscreennotification.h
++       osd.cpp
++       osd.h
++       popup_input_filter.cpp
++       popup_input_filter.h
++       qml/onscreennotification/plasma/main.qml
++       qml/outline/*
++       scripts/enforcedeco/*
++       tests/libinputtest.cpp
++       tests/normalhintsbasesizetest.cpp
++       tests/pointergesturestest.cpp
++       tests/pointergesturestest.qml
++       tests/screenedgeshowtest.cpp
++       tests/unmapdestroytest.qml
++       tests/waylandclienttest.cpp
++       tests/waylandclienttest.h
++       tests/x11shadowreader.cpp
++Copyright: 2014-2017, Martin Graesslin <mgraesslin@kde.org>
++License: GPL-2+3+KDEeV
++
++Files: effects/dialogparent/package/metadata.desktop
++       effects/eyeonscreen/package/metadata.desktop
++       effects/fade/package/metadata.desktop
++       effects/fadedesktop/package/metadata.desktop
++       effects/frozenapp/package/metadata.desktop
++       effects/login/package/metadata.desktop
++       effects/logout/package/metadata.desktop
++       effects/maximize/package/metadata.desktop
++       effects/morphingpopups/package/metadata.desktop
++       effects/scalein/package/metadata.desktop
++       effects/translucency/package/metadata.desktop
++       effects/windowaperture/package/metadata.desktop
++       effects/wobblywindows/wobblywindows.cpp
++       effects/wobblywindows/wobblywindows.h
++       plugins/kdecorations/aurorae/themes/plastik/package/metadata.desktop
++       po/bg/kcmkwindecoration.po
++       po/bg/kcmkwinrules.po
++       po/bg/kcmkwm.po
++       po/bg/kwin.po
++       po/bg/kwin_clients.po
++       scripts/desktopchangeosd/metadata.desktop
++       scripts/enforcedeco/metadata.desktop
++       scripts/minimizeall/metadata.desktop
++       scripts/synchronizeskipswitcher/metadata.desktop
++       scripts/videowall/metadata.desktop
++Copyright: 2008, Cédric Borgese <cedric.borgese@gmail.com>
++License: GPL
++
++License: GPL
++ This file is licensed under the GPL.
++ --
++ On Debian systems, the complete text of the GNU General Public License
++ can be found in `/usr/share/common-licenses/GPL'.
++
++Files: cmake/*
++Copyright: 2014, Alex Merry <alex.merry@kde.org>
++           2014, Fredrik Höglund <fredrik@kde.org>
++           2006-2007, Laurent Montel <montel@kde.org>
++           2014-2016, Martin Gräßlin <mgraesslin@kde.org>
++           2010, Rafael Fernández López <ereslibre@kde.org>
++           2016, Takahiro Hashimoto <kenya888@gmail.com>
++License: BSD-3-clause
++ Redistribution and use in source and binary forms, with or without
++ modification, are permitted provided that the following conditions
++ are met:
++ .
++ 1. Redistributions of source code must retain the copyright
++    notice, this list of conditions and the following disclaimer.
++ 2. Redistributions in binary form must reproduce the copyright
++    notice, this list of conditions and the following disclaimer in the
++    documentation and/or other materials provided with the distribution.
++ 3. The name of the author may not be used to endorse or promote products
++    derived from this software without specific prior written permission.
++ .
++ THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESS OR
++ IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
++ OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
++ IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT,
++ INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
++ NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++ DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++ THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++ (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
++ THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++
++Files: kcmkwin/kwinscreenedges/screenpreviewwidget.cpp
++       kcmkwin/kwinscreenedges/screenpreviewwidget.h
++       packageplugins/aurorae/aurorae.cpp
++       packageplugins/aurorae/aurorae.h
++       packageplugins/decoration/decoration.cpp
++       packageplugins/decoration/decoration.h
++       packageplugins/scripts/scripts.cpp
++       packageplugins/scripts/scripts.h
++       packageplugins/windowswitcher/windowswitcher.cpp
++       packageplugins/windowswitcher/windowswitcher.h
++Copyright: 2017, Demitrius Belai <demitriusbelai@gmail.com>
++           2017, Marco Martin <mart@kde.org>
++           2009, Marco Martin <notmart@gmail.com>
++License: LGPL-2+
++
++Files: kcmkwin/kwincompositing/test/modeltest.cpp
++       kcmkwin/kwincompositing/test/modeltest.h
++Copyright: 2013, Digia Plc and/or its subsidiary(-ies)
++License: GPL-3_or_LGPL-2.1-QTexception-1.1
++ * $QT_BEGIN_LICENSE:LGPL$
++ * Commercial License Usage
++ * Licensees holding valid commercial Qt licenses may use this file in
++ * accordance with the commercial license agreement provided with the
++ * Software or, alternatively, in accordance with the terms contained in
++ * a written agreement between you and Digia.  For licensing terms and
++ * conditions see http://qt.digia.com/licensing.  For further information
++ * use the contact form at http://qt.digia.com/contact-us.
++ *
++ * GNU Lesser General Public License Usage
++ * Alternatively, this file may be used under the terms of the GNU Lesser
++ * General Public License version 2.1 as published by the Free Software
++ * Foundation and appearing in the file LICENSE.LGPL included in the
++ * packaging of this file.  Please review the following information to
++ * ensure the GNU Lesser General Public License version 2.1 requirements
++ * will be met: http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++ *
++ * In addition, as a special exception, Digia gives you certain additional
++ * rights.  These rights are described in the Digia Qt LGPL Exception
++ * version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
++ *
++ * GNU General Public License Usage
++ * Alternatively, this file may be used under the terms of the GNU
++ * General Public License version 3.0 as published by the Free Software
++ * Foundation and appearing in the file LICENSE.GPL included in the
++ * packaging of this file.  Please review the following information to
++ * ensure the GNU General Public License version 3.0 requirements will be
++ * met: http://www.gnu.org/copyleft/gpl.html.
++ *
++ *
++ * $QT_END_LICENSE$
++ --
++ On Debian systems, the complete text of the GNU General Public License
++ version 3 can be found in `/usr/share/common-licenses/GPL-3', likewise, the
++ complete text of the GNU Lesser General Public License version 2.1 can be
++ found in `/usr/share/common-licenses/LGPL-2.1'.
++
++Files: plugins/platforms/hwcomposer/egl_hwcomposer_backend.cpp
++       plugins/platforms/hwcomposer/egl_hwcomposer_backend.h
++       plugins/platforms/hwcomposer/hwcomposer_backend.cpp
++       plugins/platforms/hwcomposer/hwcomposer_backend.h
++       plugins/platforms/hwcomposer/logging.cpp
++       plugins/platforms/hwcomposer/logging.h
++       plugins/platforms/hwcomposer/screens_hwcomposer.cpp
++       plugins/platforms/hwcomposer/screens_hwcomposer.h
++Copyright: 2015, Martin Gräßlin <mgraesslin@kde.org>
++License: GPL-3+
++
++Files: killer/killer.cpp
++Copyright: 2003, Lubos Lunak <l.lunak@kde.org>
++License: Expat
++
++Files: scripting/timer.cpp
++Copyright: 2007, Richard J. Moore <rich@kde.org>
++License: LGPL-2
++
++Files: doc/en/windowspecific/index.docbook
++Copyright: see the UserBase https://userbase.kde.org/index.php?title=KWin_Rules&action=history
++           Lauri.Watts
++License: GFDL-1.2+
++
++License: GFDL-1.2+
++ Permission is granted to copy, distribute and/or modify this document
++ under the terms of the GNU Free Documentation License, Version 1.2
++ or any later version published by the Free Software Foundation;
++ with no Invariant Sections, no Front-Cover Texts, and no Back-Cover Texts.
++ A copy of the license is included in the section entitled "GNU
++ Free Documentation License".
++ --
++ The complete text of the GNU Free Documentation License version 1.2
++ can be found in `/usr/share/common-licenses/GFDL-1.2'.
++
++Files: debian/*
++Copyright: 2014, Scarlett Clark <scarlett@scarlettgatelyclark.com>
++License: GPL-2+
++
++License: Expat
++ Permission is hereby granted, free of charge, to any person obtaining a
++ copy of this software and associated documentation files (the "Software"),
++ to deal in the Software without restriction, including without limitation
++ the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ and/or sell copies of the Software, and to permit persons to whom the
++ Software is furnished to do so, subject to the following conditions:
++ .
++ The above copyright notice and this permission notice shall be included in
++ all copies or substantial portions of the Software.
++ .
++ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++ FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
++ DEALINGS IN THE SOFTWARE.
++
++License: GPL-2+
++ This package is free software; you can redistribute it and/or modify
++ it under the terms of the GNU General Public License as published by
++ the Free Software Foundation; either version 2 of the License, or
++ (at your option) any later version.
++ .
++ This package is distributed in the hope that it will be useful,
++ but WITHOUT ANY WARRANTY; without even the implied warranty of
++ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ GNU General Public License for more details.
++ .
++ You should have received a copy of the GNU General Public License
++ along with this program. If not, see <http://www.gnu.org/licenses/>
++ --
++ On Debian systems, the complete text of the GNU General
++ Public License version 2 can be found in `/usr/share/common-licenses/GPL-2'.
++
++License: GPL-2+3+KDEeV
++ This program is free software; you can redistribute it and/or
++ modify it under the terms of the GNU General Public License as
++ published by the Free Software Foundation; either version 2 of
++ the License or (at your option) version 3 or any later version
++ accepted by the membership of KDE e.V. (or its successor approved
++ by the membership of KDE e.V.), which shall act as a proxy
++ defined in Section 14 of version 3 of the license.
++ .
++ This program is distributed in the hope that it will be useful,
++ but WITHOUT ANY WARRANTY; without even the implied warranty of
++ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ GNU General Public License for more details.
++ .
++ You should have received a copy of the GNU General Public License
++ along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ --
++ On Debian systems, the complete text of the GNU General Public License
++ version 2 can be found in `/usr/share/common-licenses/GPL-2', likewise, the
++ complete text of the GNU General Public License version 3 can be found in
++ `/usr/share/common-licenses/GPL-3'.
++
++License: GPL-3+
++ This program is free software; you can redistribute it and/or modify
++ it under the terms of the GNU General Public License as published by
++ the Free Software Foundation; either version 3 of the License, or
++ (at your option) any later version.
++ .
++ This program is distributed in the hope that it will be useful,
++ but WITHOUT ANY WARRANTY; without even the implied warranty of
++ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ GNU General Public License for more details.
++ .
++ The complete text of the GNU General Public License version 3 can be found in
++ `/usr/share/common-licenses/GPL-3'.
++
++License: LGPL-2
++ This program is free software; you can redistribute it and/or modify
++ it under the terms of the GNU Library General Public License version 2 as
++ published by the Free Software Foundation
++ .
++ This program is distributed in the hope that it will be useful,
++ but WITHOUT ANY WARRANTY; without even the implied warranty of
++ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ GNU General Public License for more details
++ .
++ You should have received a copy of the GNU Library General Public
++ License along with this program; if not, write to the
++ Free Software Foundation, Inc.,
++ 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
++ --
++ On Debian systems, the complete text of the GNU Library General Public
++ License version 2 can be found in `/usr/share/common-licenses/LGPL-2'.
++
++License: LGPL-2+
++ This library is free software; you can redistribute it and/or
++ modify it under the terms of the GNU Library General Public
++ License as published by the Free Software Foundation; either
++ version 2 of the License, or (at your option) any later version.
++ .
++ This library is distributed in the hope that it will be useful,
++ but WITHOUT ANY WARRANTY; without even the implied warranty of
++ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ Library General Public License for more details.
++ .
++ You should have received a copy of the GNU Library General Public License
++ along with this library; see the file COPYING.LIB.  If not, write to
++ the Free Software Foundation, Inc., 51 Franklin Street, Fifth Floor,
++ Boston, MA 02110-1301, USA.
++ --
++ On Debian systems, the complete text of the GNU Library General Public
++ License version 2 can be found in `/usr/share/common-licenses/LGPL-2'.
+diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/debian/kwin-common.install kwin/debian/kwin-common.install
+--- kwin-5.15.5/debian/kwin-common.install	1969-12-31 19:00:00.000000000 -0500
++++ kwin/debian/kwin-common.install	2019-06-12 14:39:30.172877515 -0500
+@@ -0,0 +1,19 @@
++etc/xdg/aurorae.knsrc
++etc/xdg/kwin*.knsrc
++etc/xdg/org_kde_kwin.categories
++usr/lib/*/kconf_update_bin/kwin5_update_default_rules
++usr/lib/*/libexec/kwin*
++usr/lib/*/libexec/org_kde_kwin_xclipboard_syncer
++usr/lib/*/libkcmkwincommon.so.5*
++usr/lib/*/libkdeinit5_kwin_rules_dialog.so
++usr/lib/*/libkwin.so.5
++usr/lib/*/libkwin.so.5.*
++usr/lib/*/qt5/plugins/kcm_kwin*.so
++usr/lib/*/qt5/plugins/kcms/kcm_kwin_virtualdesktops.so
++usr/lib/*/qt5/plugins/kpackage/packagestructure/
++usr/lib/*/qt5/plugins/kwin*.so
++usr/lib/*/qt5/plugins/kwin/
++usr/lib/*/qt5/plugins/org.kde.kdecoration2/kwin5_aurorae.so
++usr/lib/*/qt5/plugins/org.kde.kglobalaccel5.platforms/KF5GlobalAccelPrivateKWin.so
++usr/lib/*/qt5/plugins/org.kde.kwin.scenes/
++usr/lib/*/qt5/qml/org/kde/kwin/
+diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/debian/kwin-common.lintian-overrides kwin/debian/kwin-common.lintian-overrides
+--- kwin-5.15.5/debian/kwin-common.lintian-overrides	1969-12-31 19:00:00.000000000 -0500
++++ kwin/debian/kwin-common.lintian-overrides	2019-06-12 14:39:30.172877515 -0500
+@@ -0,0 +1,5 @@
++kwin-common: package-name-doesnt-match-sonames libkcmkwincommon5 libkdeinit5-kwin-rules-dialog libkwin5
++kwin-common: dev-pkg-without-shlib-symlink usr/lib/*/libkdeinit5_kwin_rules_dialog.so usr/lib/*/libkdeinit5_kwin_rules_dialog.so
++kwin-common: dev-pkg-without-shlib-symlink usr/lib/*/libkwin.so
++kwin-common: shlib-without-versioned-soname usr/lib/*/libkdeinit5_kwin_rules_dialog.so libkdeinit5_kwin_rules_dialog.so
++kwin-common: dev-pkg-without-shlib-symlink usr/lib/*/libkcmkwincommon.so.* usr/lib/x86_64-linux-gnu/libkcmkwincommon.so
+diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/debian/kwin-data.install kwin/debian/kwin-data.install
+--- kwin-5.15.5/debian/kwin-data.install	1969-12-31 19:00:00.000000000 -0500
++++ kwin/debian/kwin-data.install	2019-06-12 14:39:30.172877515 -0500
+@@ -0,0 +1,28 @@
++usr/share/config.kcfg/kwin.kcfg
++usr/share/config.kcfg/kwin_colorcorrect.kcfg
++usr/share/doc/*/*/kcontrol/
++usr/share/icons/*/*/apps/kwin.*
++usr/share/kconf_update/kwin.upd
++usr/share/knotifications5/kwin.notifyrc
++usr/share/kpackage/kcms/kcm_kwin_virtualdesktops/
++usr/share/kservices5/kcm_kwin_virtualdesktops.desktop
++usr/share/kservices5/kcmkwineffects.desktop
++usr/share/kservices5/kwin*.desktop
++usr/share/kservices5/kwin/
++usr/share/kservicetypes5/kwin*.desktop
++usr/share/kwin/
++usr/share/kwincompositing/
++usr/share/locale/*/*/kcm-kwin-scripts.mo
++usr/share/locale/*/*/kcm_kwin_virtualdesktops.mo
++usr/share/locale/*/*/kcm_kwindecoration.mo
++usr/share/locale/*/*/kcm_kwintabbox.mo
++usr/share/locale/*/*/kcmkwincommon.mo
++usr/share/locale/*/*/kcmkwincompositing.mo
++usr/share/locale/*/*/kcmkwinrules.mo
++usr/share/locale/*/*/kcmkwinscreenedges.mo
++usr/share/locale/*/*/kcmkwm.mo
++usr/share/locale/*/*/kwin.mo
++usr/share/locale/*/*/kwin_clients.mo
++usr/share/locale/*/*/kwin_effects.mo
++usr/share/locale/*/*/kwin_scripting.mo
++usr/share/locale/*/*/kwin_scripts.mo
+diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/debian/kwin-data.qml-ignore kwin/debian/kwin-data.qml-ignore
+--- kwin-5.15.5/debian/kwin-data.qml-ignore	1969-12-31 19:00:00.000000000 -0500
++++ kwin/debian/kwin-data.qml-ignore	2019-06-12 14:39:30.172877515 -0500
+@@ -0,0 +1,6 @@
++# In kwin.deb
++org.kde.kwin 2.0
++org.kde.kwin.decoration 0.1
++org.kde.kwin.decorations.*
++org.kde.kwin.kwincompositing 1.0
++org.kde.kwin.private.*
+diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/debian/kwin-dev.acc.in kwin/debian/kwin-dev.acc.in
+--- kwin-5.15.5/debian/kwin-dev.acc.in	1969-12-31 19:00:00.000000000 -0500
++++ kwin/debian/kwin-dev.acc.in	2019-06-12 14:39:30.172877515 -0500
+@@ -0,0 +1,37 @@
++<?xml version="1.0" encoding="utf-8"?>
++<descriptor>
++
++<version>
++    5.2.0.1
++</version>
++
++<headers>
++    /usr/include/kwin_export.h
++    /usr/include/kwinanimationeffect.h
++    /usr/include/kwinconfig.h
++    /usr/include/kwineffects.h
++    /usr/include/kwineffects_export.h
++    /usr/include/kwinglobals.h
++    /usr/include/kwinglplatform.h
++    /usr/include/kwingltexture.h
++    /usr/include/kwinglutils.h
++    /usr/include/kwinglutils_export.h
++    /usr/include/kwinglutils_funcs.h
++    /usr/include/kwinxrenderutils.h
++    /usr/include/kwinxrenderutils_export.h
++</headers>
++
++<libs>
++    /usr/lib/@@DEB_HOST_MULTIARCH@@/libkwin4_effect_builtins.so
++    /usr/lib/@@DEB_HOST_MULTIARCH@@/libkwineffects.so
++    /usr/lib/@@DEB_HOST_MULTIARCH@@/libkwinglutils.so
++    /usr/lib/@@DEB_HOST_MULTIARCH@@/libkwinxrenderutils.so
++</libs>
++
++<gcc_options>
++    -fPIC
++    -std=c++11
++    -fno-keep-inline-functions
++</gcc_options>
++
++</descriptor>
+diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/debian/kwin-dev.install kwin/debian/kwin-dev.install
+--- kwin-5.15.5/debian/kwin-dev.install	1969-12-31 19:00:00.000000000 -0500
++++ kwin/debian/kwin-dev.install	2019-06-12 14:39:30.172877515 -0500
+@@ -0,0 +1,9 @@
++usr/include/kwin*.h
++usr/lib/*/cmake/KWinDBusInterface/
++usr/lib/*/libkwin4_effect_builtins.so
++usr/lib/*/libkwineffects.so
++usr/lib/*/libkwingl*utils.so
++usr/lib/*/libkwinxrenderutils.so
++usr/share/dbus-1/interfaces/org.kde.KWin.VirtualDesktopManager.xml
++usr/share/dbus-1/interfaces/org.kde.KWin.xml
++usr/share/dbus-1/interfaces/org.kde.kwin.*
+diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/debian/kwin-wayland-backend-drm.install kwin/debian/kwin-wayland-backend-drm.install
+--- kwin-5.15.5/debian/kwin-wayland-backend-drm.install	1969-12-31 19:00:00.000000000 -0500
++++ kwin/debian/kwin-wayland-backend-drm.install	2019-06-12 14:39:30.172877515 -0500
+@@ -0,0 +1 @@
++usr/lib/*/qt5/plugins/org.kde.kwin.waylandbackends/KWinWaylandDrmBackend.so
+diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/debian/kwin-wayland-backend-fbdev.install kwin/debian/kwin-wayland-backend-fbdev.install
+--- kwin-5.15.5/debian/kwin-wayland-backend-fbdev.install	1969-12-31 19:00:00.000000000 -0500
++++ kwin/debian/kwin-wayland-backend-fbdev.install	2019-06-12 14:39:30.172877515 -0500
+@@ -0,0 +1 @@
++usr/lib/*/qt5/plugins/org.kde.kwin.waylandbackends/KWinWaylandFbdevBackend.so
+diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/debian/kwin-wayland-backend-virtual.install kwin/debian/kwin-wayland-backend-virtual.install
+--- kwin-5.15.5/debian/kwin-wayland-backend-virtual.install	1969-12-31 19:00:00.000000000 -0500
++++ kwin/debian/kwin-wayland-backend-virtual.install	2019-06-12 14:39:30.172877515 -0500
+@@ -0,0 +1 @@
++usr/lib/*/qt5/plugins/org.kde.kwin.waylandbackends/KWinWaylandVirtualBackend.so
+diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/debian/kwin-wayland-backend-wayland.install kwin/debian/kwin-wayland-backend-wayland.install
+--- kwin-5.15.5/debian/kwin-wayland-backend-wayland.install	1969-12-31 19:00:00.000000000 -0500
++++ kwin/debian/kwin-wayland-backend-wayland.install	2019-06-12 14:39:30.172877515 -0500
+@@ -0,0 +1 @@
++usr/lib/*/qt5/plugins/org.kde.kwin.waylandbackends/KWinWaylandWaylandBackend.so
+diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/debian/kwin-wayland-backend-x11.install kwin/debian/kwin-wayland-backend-x11.install
+--- kwin-5.15.5/debian/kwin-wayland-backend-x11.install	1969-12-31 19:00:00.000000000 -0500
++++ kwin/debian/kwin-wayland-backend-x11.install	2019-06-12 14:39:30.172877515 -0500
+@@ -0,0 +1 @@
++usr/lib/*/qt5/plugins/org.kde.kwin.waylandbackends/KWinWaylandX11Backend.so
+diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/debian/kwin-wayland.install kwin/debian/kwin-wayland.install
+--- kwin-5.15.5/debian/kwin-wayland.install	1969-12-31 19:00:00.000000000 -0500
++++ kwin/debian/kwin-wayland.install	2019-06-12 14:39:30.172877515 -0500
+@@ -0,0 +1,3 @@
++usr/bin/kwin_wayland
++usr/lib/*/qt5/plugins/kf5/org.kde.kidletime.platforms/KF5IdleTimeKWinWaylandPrivatePlugin.so
++usr/lib/*/qt5/plugins/platforms/KWinQpaPlugin.so
+diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/debian/kwin-wayland.lintian-overrides kwin/debian/kwin-wayland.lintian-overrides
+--- kwin-5.15.5/debian/kwin-wayland.lintian-overrides	1969-12-31 19:00:00.000000000 -0500
++++ kwin/debian/kwin-wayland.lintian-overrides	2019-06-12 14:39:30.172877515 -0500
+@@ -0,0 +1,2 @@
++kwin-wayland: binary-without-manpage usr/bin/kwin_wayland
++kwin-wayland: postinst-must-call-ldconfig usr/lib/*/libkdeinit5_kwin_wayland.so
+diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/debian/kwin-wayland.postinst kwin/debian/kwin-wayland.postinst
+--- kwin-5.15.5/debian/kwin-wayland.postinst	1969-12-31 19:00:00.000000000 -0500
++++ kwin/debian/kwin-wayland.postinst	2019-06-12 14:39:30.172877515 -0500
+@@ -0,0 +1,19 @@
++#!/bin/sh
++
++set -e
++
++if [ "$1" = configure ]; then
++    # Set the capabilities
++    if command -v setcap > /dev/null && \
++       setcap "CAP_SYS_RESOURCE=+ep" \
++            /usr/bin/kwin_wayland; then
++        echo "Sucessfully set capabilities for kwin_wayland"
++    else
++        echo "Failed to set capabilities for kwin_wayland" >&2
++    fi
++fi
++
++#DEBHELPER#
++
++exit 0
++
+diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/debian/kwin-x11.install kwin/debian/kwin-x11.install
+--- kwin-5.15.5/debian/kwin-x11.install	1969-12-31 19:00:00.000000000 -0500
++++ kwin/debian/kwin-x11.install	2019-06-12 14:39:30.172877515 -0500
+@@ -0,0 +1,3 @@
++usr/bin/kwin_x11
++usr/lib/*/libkdeinit5_kwin_x11.so
++usr/lib/*/qt5/plugins/org.kde.kwin.platforms/KWinX11Platform.so
+diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/debian/kwin-x11.links kwin/debian/kwin-x11.links
+--- kwin-5.15.5/debian/kwin-x11.links	1969-12-31 19:00:00.000000000 -0500
++++ kwin/debian/kwin-x11.links	2019-06-12 14:39:30.172877515 -0500
+@@ -0,0 +1 @@
++usr/bin/kwin_x11 usr/bin/kwin
+diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/debian/kwin-x11.lintian-overrides kwin/debian/kwin-x11.lintian-overrides
+--- kwin-5.15.5/debian/kwin-x11.lintian-overrides	1969-12-31 19:00:00.000000000 -0500
++++ kwin/debian/kwin-x11.lintian-overrides	2019-06-12 14:39:30.172877515 -0500
+@@ -0,0 +1,5 @@
++kwin-x11: package-name-doesnt-match-sonames libkdeinit5-kwin-x11
++kwin-x11: binary-without-manpage usr/bin/kwin_x11
++kwin-x11: shlib-without-versioned-soname usr/lib/*/libkdeinit5_kwin_x11.so libkdeinit5_kwin_x11.so
++kwin-x11: postinst-must-call-ldconfig usr/lib/*/libkdeinit5_kwin_x11.so
++kwin-x11: package-must-activate-ldconfig-trigger usr/lib/*/libkdeinit5_kwin_x11.so
+diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/debian/kwin-x11.postinst kwin/debian/kwin-x11.postinst
+--- kwin-5.15.5/debian/kwin-x11.postinst	1969-12-31 19:00:00.000000000 -0500
++++ kwin/debian/kwin-x11.postinst	2019-06-12 14:39:30.172877515 -0500
+@@ -0,0 +1,43 @@
++#! /bin/sh
++# postinst script for kwin
++#
++# see: dh_installdeb(1)
++
++set -e
++
++# summary of how this script can be called:
++#        * <postinst> `configure' <most-recently-configured-version>
++#        * <old-postinst> `abort-upgrade' <new version>
++#        * <conflictor's-postinst> `abort-remove' `in-favour' <package>
++#          <new-version>
++#        * <deconfigured's-postinst> `abort-deconfigure' `in-favour'
++#          <failed-install-package> <version> `removing'
++#          <conflicting-package> <version>
++# for details, see http://www.debian.org/doc/debian-policy/ or
++# the debian-policy package
++#
++
++case "$1" in
++    configure)
++        update-alternatives --remove x-window-manager /usr/bin/kwin
++	update-alternatives --install /usr/bin/x-window-manager x-window-manager /usr/bin/kwin_x11 50
++    ;;
++
++    abort-upgrade|abort-remove|abort-deconfigure)
++
++    ;;
++
++    *)
++        echo "postinst called with unknown argument \`$1'" >&2
++        exit 1
++    ;;
++esac
++
++# dh_installdeb will replace this with shell code automatically
++# generated by other debhelper scripts.
++
++#DEBHELPER#
++
++exit 0
++
++
+diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/debian/kwin-x11.prerm kwin/debian/kwin-x11.prerm
+--- kwin-5.15.5/debian/kwin-x11.prerm	1969-12-31 19:00:00.000000000 -0500
++++ kwin/debian/kwin-x11.prerm	2019-06-12 14:39:30.172877515 -0500
+@@ -0,0 +1,44 @@
++#! /bin/sh
++# prerm script for kwin
++#
++# see: dh_installdeb(1)
++
++set -e
++
++# summary of how this script can be called:
++#        * <prerm> `remove'
++#        * <old-prerm> `upgrade' <new-version>
++#        * <new-prerm> `failed-upgrade' <old-version>
++#        * <conflictor's-prerm> `remove' `in-favour' <package> <new-version>
++#        * <deconfigured's-prerm> `deconfigure' `in-favour'
++#          <package-being-installed> <version> `removing'
++#          <conflicting-package> <version>
++# for details, see http://www.debian.org/doc/debian-policy/ or
++# the debian-policy package
++
++
++case "$1" in
++    remove)
++        update-alternatives --remove x-window-manager /usr/bin/kwin_x11
++    ;;
++
++    upgrade|deconfigure)
++    ;;
++
++    failed-upgrade)
++    ;;
++
++    *)
++        echo "prerm called with unknown argument \`$1'" >&2
++        exit 1
++    ;;
++esac
++
++# dh_installdeb will replace this with shell code automatically
++# generated by other debhelper scripts.
++
++#DEBHELPER#
++
++exit 0
++
++
+diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/debian/libkwin4-effect-builtins1.install kwin/debian/libkwin4-effect-builtins1.install
+--- kwin-5.15.5/debian/libkwin4-effect-builtins1.install	1969-12-31 19:00:00.000000000 -0500
++++ kwin/debian/libkwin4-effect-builtins1.install	2019-06-12 14:39:30.172877515 -0500
+@@ -0,0 +1,2 @@
++usr/lib/*/libkwin4_effect_builtins.so.1
++usr/lib/*/libkwin4_effect_builtins.so.1.*
+diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/debian/libkwineffects12.install kwin/debian/libkwineffects12.install
+--- kwin-5.15.5/debian/libkwineffects12.install	1969-12-31 19:00:00.000000000 -0500
++++ kwin/debian/libkwineffects12.install	2019-06-12 14:39:30.172877515 -0500
+@@ -0,0 +1,2 @@
++usr/lib/*/libkwineffects.so.12
++usr/lib/*/libkwineffects.so.5.*
+diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/debian/libkwineffects12.symbols kwin/debian/libkwineffects12.symbols
+--- kwin-5.15.5/debian/libkwineffects12.symbols	1969-12-31 19:00:00.000000000 -0500
++++ kwin/debian/libkwineffects12.symbols	2019-06-12 14:39:30.172877515 -0500
+@@ -0,0 +1,390 @@
++# SymbolsHelper-Confirmed: 4:5.14.80+git20190115 amd64
++libkwineffects.so.12 libkwineffects12 #MINVER#
++ _ZN4KWin11EffectFrame15enableCrossFadeEb@Base 4:5.1.95+git20150122
++ _ZN4KWin11EffectFrame20setCrossFadeProgressEd@Base 4:5.1.95+git20150122
++ _ZN4KWin11EffectFrame25setScreenProjectionMatrixERK10QMatrix4x4@Base 4:5.6.3
++ _ZN4KWin11EffectFrameC1Ev@Base 4:5.1.95+git20150122
++ _ZN4KWin11EffectFrameC2Ev@Base 4:5.1.95+git20150122
++ _ZN4KWin11EffectFrameD0Ev@Base 4:5.1.95+git20150122
++ _ZN4KWin11EffectFrameD1Ev@Base 4:5.1.95+git20150122
++ _ZN4KWin11EffectFrameD2Ev@Base 4:5.1.95+git20150122
++ _ZN4KWin12EffectWindow11qt_metacallEN11QMetaObject4CallEiPPv@Base 4:5.1.95+git20150122
++ _ZN4KWin12EffectWindow11qt_metacastEPKc@Base 4:5.1.95+git20150122
++ _ZN4KWin12EffectWindow12setMinimizedEb@Base 4:5.1.95+git20150122
++ _ZN4KWin12EffectWindow16staticMetaObjectE@Base 4:5.1.95+git20150122
++ _ZN4KWin12EffectWindowC1EP7QObject@Base 4:5.1.95+git20150122
++ _ZN4KWin12EffectWindowC2EP7QObject@Base 4:5.1.95+git20150122
++ _ZN4KWin12EffectWindowD0Ev@Base 4:5.1.95+git20150122
++ _ZN4KWin12EffectWindowD1Ev@Base 4:5.1.95+git20150122
++ _ZN4KWin12EffectWindowD2Ev@Base 4:5.1.95+git20150122
++ _ZN4KWin12PaintClipper3popERK7QRegion@Base 4:5.1.95+git20150122
++ _ZN4KWin12PaintClipper4clipEv@Base 4:5.1.95+git20150122
++ _ZN4KWin12PaintClipper4pushERK7QRegion@Base 4:5.1.95+git20150122
++ _ZN4KWin12PaintClipper5areasE@Base 4:5.1.95+git20150122
++ _ZN4KWin12PaintClipper8Iterator4nextEv@Base 4:5.1.95+git20150122
++ _ZN4KWin12PaintClipper8Iterator6isDoneEv@Base 4:5.1.95+git20150122
++ _ZN4KWin12PaintClipper8IteratorC1Ev@Base 4:5.1.95+git20150122
++ _ZN4KWin12PaintClipper8IteratorC2Ev@Base 4:5.1.95+git20150122
++ _ZN4KWin12PaintClipper8IteratorD1Ev@Base 4:5.1.95+git20150122
++ _ZN4KWin12PaintClipper8IteratorD2Ev@Base 4:5.1.95+git20150122
++ _ZN4KWin12PaintClipper9paintAreaEv@Base 4:5.1.95+git20150122
++ _ZN4KWin12PaintClipperC1ERK7QRegion@Base 4:5.1.95+git20150122
++ _ZN4KWin12PaintClipperC2ERK7QRegion@Base 4:5.1.95+git20150122
++ _ZN4KWin12PaintClipperD1Ev@Base 4:5.1.95+git20150122
++ _ZN4KWin12PaintClipperD2Ev@Base 4:5.1.95+git20150122
++ _ZN4KWin14EffectsHandler10tabRemovedEPNS_12EffectWindowES2_@Base 4:5.1.95+git20150122
++ _ZN4KWin14EffectsHandler11qt_metacallEN11QMetaObject4CallEiPPv@Base 4:5.1.95+git20150122
++ _ZN4KWin14EffectsHandler11qt_metacastEPKc@Base 4:5.1.95+git20150122
++ _ZN4KWin14EffectsHandler11tabBoxAddedEi@Base 4:5.1.95+git20150122
++ _ZN4KWin14EffectsHandler11windowAddedEPNS_12EffectWindowE@Base 4:5.1.95+git20150122
++ (optional=gccinternal)_ZN4KWin14EffectsHandler11windowShownEPNS_12EffectWindowE@Base 4:5.7.2+git20160804
++ _ZN4KWin14EffectsHandler12mouseChangedERK6QPointS3_6QFlagsIN2Qt11MouseButtonEES7_S4_INS5_16KeyboardModifierEES9_@Base 4:5.1.95+git20150122
++ _ZN4KWin14EffectsHandler12tabBoxClosedEv@Base 4:5.1.95+git20150122
++ _ZN4KWin14EffectsHandler12windowClosedEPNS_12EffectWindowE@Base 4:5.1.95+git20150122
++ (optional=gccinternal)_ZN4KWin14EffectsHandler12windowHiddenEPNS_12EffectWindowE@Base 4:5.7.2+git20160804
++ _ZN4KWin14EffectsHandler13activityAddedERK7QString@Base 4:5.1.95+git20150122
++ _ZN4KWin14EffectsHandler13tabBoxUpdatedEv@Base 4:5.1.95+git20150122
++ _ZN4KWin14EffectsHandler13windowDamagedEPNS_12EffectWindowERK5QRect@Base 4:5.1.95+git20150122
++ _ZN4KWin14EffectsHandler13windowDeletedEPNS_12EffectWindowE@Base 4:5.1.95+git20150122
++ _ZN4KWin14EffectsHandler14desktopChangedEii@Base 4:5.1.95+git20150122
++ _ZN4KWin14EffectsHandler14desktopChangedEiiPNS_12EffectWindowE@Base 4:5.1.95+git20150122
++ _ZN4KWin14EffectsHandler14propertyNotifyEPNS_12EffectWindowEl@Base 4:5.1.95+git20150122
++ _ZN4KWin14EffectsHandler14tabBoxKeyEventEP9QKeyEvent@Base 4:5.1.95+git20150122
++ _ZN4KWin14EffectsHandler15activityRemovedERK7QString@Base 4:5.1.95+git20150122
++ _ZN4KWin14EffectsHandler15windowActivatedEPNS_12EffectWindowE@Base 4:5.1.95+git20150122
++ _ZN4KWin14EffectsHandler15windowMinimizedEPNS_12EffectWindowE@Base 4:5.1.95+git20150122
++ _ZN4KWin14EffectsHandler16staticMetaObjectE@Base 4:5.1.95+git20150122
++ _ZN4KWin14EffectsHandler17windowDataChangedEPNS_12EffectWindowEi@Base 4:5.8.4
++ _ZN4KWin14EffectsHandler17windowUnminimizedEPNS_12EffectWindowE@Base 4:5.1.95+git20150122
++ _ZN4KWin14EffectsHandler18cursorShapeChangedEv@Base 4:5.3.0
++ _ZN4KWin14EffectsHandler20numberScreensChangedEv@Base 4:5.1.95+git20150122
++ _ZN4KWin14EffectsHandler20screenLockingChangedEb@Base 4:5.1.95+git20150122
++ _ZN4KWin14EffectsHandler20stackingOrderChangedEv@Base 4:5.1.95+git20150122
++ _ZN4KWin14EffectsHandler20windowOpacityChangedEPNS_12EffectWindowEdd@Base 4:5.1.95+git20150122
++ _ZN4KWin14EffectsHandler20windowPaddingChangedEPNS_12EffectWindowERK5QRect@Base 4:5.1.95+git20150122
++ _ZN4KWin14EffectsHandler20xcbConnectionChangedEv@Base 4:5.10.95
++ _ZN4KWin14EffectsHandler21numberDesktopsChangedEj@Base 4:5.1.95+git20150122
++ _ZN4KWin14EffectsHandler21screenEdgeApproachingENS_14ElectricBorderEdRK5QRect@Base 4:5.1.95+git20150122
++ _ZN4KWin14EffectsHandler21screenGeometryChangedERK5QSize@Base 4:5.1.95+git20150122
++ _ZN4KWin14EffectsHandler21showingDesktopChangedEb@Base 4:5.3.0
++ _ZN4KWin14EffectsHandler21windowModalityChangedEPNS_12EffectWindowE@Base 4:5.1.95+git20150122
++ _ZN4KWin14EffectsHandler22currentActivityChangedERK7QString@Base 4:5.1.95+git20150122
++ _ZN4KWin14EffectsHandler22desktopPresenceChangedEPNS_12EffectWindowEii@Base 4:5.1.95+git20150122
++ _ZN4KWin14EffectsHandler22windowKeepAboveChangedEPNS_12EffectWindowE@Base 4:5.14.80+git20181026
++ _ZN4KWin14EffectsHandler22windowKeepBelowChangedEPNS_12EffectWindowE@Base 4:5.14.80+git20181026
++ _ZN4KWin14EffectsHandler23currentTabAboutToChangeEPNS_12EffectWindowES2_@Base 4:5.1.95+git20150122
++ _ZN4KWin14EffectsHandler23windowFullScreenChangedEPNS_12EffectWindowE@Base 4:5.14.80+git20181026
++ _ZN4KWin14EffectsHandler24virtualScreenSizeChangedEv@Base 4:5.1.95+git20150122
++ _ZN4KWin14EffectsHandler25windowUnresponsiveChangedEPNS_12EffectWindowEb@Base 4:5.9.95
++ _ZN4KWin14EffectsHandler26windowGeometryShapeChangedEPNS_12EffectWindowERK5QRect@Base 4:5.1.95+git20150122
++ _ZN4KWin14EffectsHandler26windowStepUserMovedResizedEPNS_12EffectWindowERK5QRect@Base 4:5.1.95+git20150122
++ _ZN4KWin14EffectsHandler27windowMaximizedStateChangedEPNS_12EffectWindowEbb@Base 4:5.1.95+git20150122
++ _ZN4KWin14EffectsHandler27windowStartUserMovedResizedEPNS_12EffectWindowE@Base 4:5.1.95+git20150122
++ _ZN4KWin14EffectsHandler28virtualScreenGeometryChangedEv@Base 4:5.1.95+git20150122
++ _ZN4KWin14EffectsHandler28windowFinishUserMovedResizedEPNS_12EffectWindowE@Base 4:5.1.95+git20150122
++ _ZN4KWin14EffectsHandler29activeFullScreenEffectChangedEv@Base 4:5.13.90
++ _ZN4KWin14EffectsHandler32hasActiveFullScreenEffectChangedEv@Base 4:5.14.80+git20181005
++ _ZN4KWin14EffectsHandler8tabAddedEPNS_12EffectWindowES2_@Base 4:5.1.95+git20150122
++ _ZN4KWin14EffectsHandlerC1ENS_15CompositingTypeE@Base 4:5.1.95+git20150122
++ _ZN4KWin14EffectsHandlerC2ENS_15CompositingTypeE@Base 4:5.1.95+git20150122
++ _ZN4KWin14EffectsHandlerD0Ev@Base 4:5.1.95+git20150122
++ _ZN4KWin14EffectsHandlerD1Ev@Base 4:5.1.95+git20150122
++ _ZN4KWin14EffectsHandlerD2Ev@Base 4:5.1.95+git20150122
++ _ZN4KWin15AnimationEffect11paintWindowEPNS_12EffectWindowEi7QRegionRNS_15WindowPaintDataE@Base 4:5.1.95+git20150122
++ _ZN4KWin15AnimationEffect11qt_metacallEN11QMetaObject4CallEiPPv@Base 4:5.1.95+git20150122
++ _ZN4KWin15AnimationEffect11qt_metacastEPKc@Base 4:5.1.95+git20150122
++ _ZN4KWin15AnimationEffect11setMetaDataENS0_8MetaTypeEjRj@Base 4:5.1.95+git20150122
++ _ZN4KWin15AnimationEffect13_windowClosedEPNS_12EffectWindowE@Base 4:5.1.95+git20150122
++ _ZN4KWin15AnimationEffect14_windowDeletedEPNS_12EffectWindowE@Base 4:5.1.95+git20150122
++ _ZN4KWin15AnimationEffect14prePaintScreenERNS_18ScreenPrePaintDataEi@Base 4:5.1.95+git20150122
++ _ZN4KWin15AnimationEffect14prePaintWindowEPNS_12EffectWindowERNS_18WindowPrePaintDataEi@Base 4:5.1.95+git20150122
++ _ZN4KWin15AnimationEffect14triggerRepaintEv@Base 4:5.1.95+git20150122
++ _ZN4KWin15AnimationEffect15postPaintScreenEv@Base 4:5.1.95+git20150122
++ _ZN4KWin15AnimationEffect16staticMetaObjectE@Base 4:5.1.95+git20150122
++ _ZN4KWin15AnimationEffect19updateLayerRepaintsEv@Base 4:5.1.95+git20150122
++ _ZN4KWin15AnimationEffect24_expandedGeometryChangedEPNS_12EffectWindowERK5QRect@Base 4:5.1.95+git20150122
++ _ZN4KWin15AnimationEffect25disconnectGeometryChangesEv@Base 4:5.1.95+git20150122
++ _ZN4KWin15AnimationEffect4initEv@Base 4:5.1.95+git20150122
++ _ZN4KWin15AnimationEffect6cancelEy@Base 4:5.1.95+git20150122
++ _ZN4KWin15AnimationEffect7s_clockE@Base 4:5.1.95+git20150122
++ _ZN4KWin15AnimationEffect8completeEy@Base 4:5.14.80+git20181230
++ _ZN4KWin15AnimationEffect8metaDataENS0_8MetaTypeEj@Base 4:5.1.95+git20150122
++ _ZN4KWin15AnimationEffect8redirectEyNS0_9DirectionE6QFlagsINS0_15TerminationFlagEE@Base 4:5.14.80+git20181230
++ _ZN4KWin15AnimationEffect8retargetEyNS_4FPx2Ei@Base 4:5.6.3
++ _ZN4KWin15AnimationEffect9p_animateEPNS_12EffectWindowENS0_9AttributeEjiNS_4FPx2E12QEasingCurveiS4_bbb@Base 4:5.14.80+git20181026
++ _ZN4KWin15AnimationEffectC1Ev@Base 4:5.1.95+git20150122
++ _ZN4KWin15AnimationEffectC2Ev@Base 4:5.1.95+git20150122
++ _ZN4KWin15AnimationEffectD0Ev@Base 4:5.6.3
++ _ZN4KWin15AnimationEffectD1Ev@Base 4:5.6.3
++ _ZN4KWin15AnimationEffectD2Ev@Base 4:5.6.3
++ _ZN4KWin15ScreenPaintDataC1ERK10QMatrix4x4RK5QRect@Base 4:5.7.5+git20161020
++ _ZN4KWin15ScreenPaintDataC1ERKS0_@Base 4:5.1.95+git20150122
++ _ZN4KWin15ScreenPaintDataC1Ev@Base 4:5.1.95+git20150122
++ _ZN4KWin15ScreenPaintDataC2ERK10QMatrix4x4RK5QRect@Base 4:5.7.5+git20161020
++ _ZN4KWin15ScreenPaintDataC2ERKS0_@Base 4:5.1.95+git20150122
++ _ZN4KWin15ScreenPaintDataC2Ev@Base 4:5.1.95+git20150122
++ _ZN4KWin15ScreenPaintDataD0Ev@Base 4:5.6.3
++ _ZN4KWin15ScreenPaintDataD1Ev@Base 4:5.6.3
++ _ZN4KWin15ScreenPaintDataD2Ev@Base 4:5.6.3
++ _ZN4KWin15ScreenPaintDataaSERKS0_@Base 4:5.1.95+git20150122
++ _ZN4KWin15ScreenPaintDatamLERK9QVector2D@Base 4:5.1.95+git20150122
++ _ZN4KWin15ScreenPaintDatamLERK9QVector3D@Base 4:5.1.95+git20150122
++ _ZN4KWin15ScreenPaintDatamLEd@Base 4:5.1.95+git20150122
++ _ZN4KWin15ScreenPaintDatapLERK6QPoint@Base 4:5.1.95+git20150122
++ _ZN4KWin15ScreenPaintDatapLERK7QPointF@Base 4:5.1.95+git20150122
++ _ZN4KWin15ScreenPaintDatapLERK9QVector2D@Base 4:5.1.95+git20150122
++ _ZN4KWin15ScreenPaintDatapLERK9QVector3D@Base 4:5.1.95+git20150122
++ _ZN4KWin15WindowPaintData10setOpacityEd@Base 4:5.1.95+git20150122
++ _ZN4KWin15WindowPaintData13setBrightnessEd@Base 4:5.1.95+git20150122
++ _ZN4KWin15WindowPaintData15multiplyOpacityEd@Base 4:5.1.95+git20150122
++ _ZN4KWin15WindowPaintData16rmodelViewMatrixEv@Base 4:5.1.95+git20150122
++ _ZN4KWin15WindowPaintData17rprojectionMatrixEv@Base 4:5.1.95+git20150122
++ _ZN4KWin15WindowPaintData18multiplyBrightnessEd@Base 4:5.1.95+git20150122
++ _ZN4KWin15WindowPaintData18multiplySaturationEd@Base 4:5.1.95+git20150122
++ _ZN4KWin15WindowPaintData18setModelViewMatrixERK10QMatrix4x4@Base 4:5.1.95+git20150122
++ _ZN4KWin15WindowPaintData19setProjectionMatrixERK10QMatrix4x4@Base 4:5.1.95+git20150122
++ _ZN4KWin15WindowPaintData20setCrossFadeProgressEd@Base 4:5.1.95+git20150122
++ _ZN4KWin15WindowPaintDataC1EPNS_12EffectWindowE@Base 4:5.1.95+git20150122
++ _ZN4KWin15WindowPaintDataC1EPNS_12EffectWindowERK10QMatrix4x4@Base 4:5.6.3
++ _ZN4KWin15WindowPaintDataC1ERKS0_@Base 4:5.1.95+git20150122
++ _ZN4KWin15WindowPaintDataC2EPNS_12EffectWindowE@Base 4:5.1.95+git20150122
++ _ZN4KWin15WindowPaintDataC2EPNS_12EffectWindowERK10QMatrix4x4@Base 4:5.6.3
++ _ZN4KWin15WindowPaintDataC2ERKS0_@Base 4:5.1.95+git20150122
++ _ZN4KWin15WindowPaintDataD0Ev@Base 4:5.1.95+git20150122
++ _ZN4KWin15WindowPaintDataD1Ev@Base 4:5.1.95+git20150122
++ _ZN4KWin15WindowPaintDataD2Ev@Base 4:5.1.95+git20150122
++ _ZN4KWin15WindowPaintDatamLERK9QVector2D@Base 4:5.1.95+git20150122
++ _ZN4KWin15WindowPaintDatamLERK9QVector3D@Base 4:5.1.95+git20150122
++ _ZN4KWin15WindowPaintDatamLEd@Base 4:5.1.95+git20150122
++ _ZN4KWin15WindowPaintDatapLERK6QPoint@Base 4:5.1.95+git20150122
++ _ZN4KWin15WindowPaintDatapLERK7QPointF@Base 4:5.1.95+git20150122
++ _ZN4KWin15WindowPaintDatapLERK9QVector2D@Base 4:5.1.95+git20150122
++ _ZN4KWin15WindowPaintDatapLERK9QVector3D@Base 4:5.1.95+git20150122
++ _ZN4KWin17EffectWindowGroupD0Ev@Base 4:5.1.95+git20150122
++ _ZN4KWin17EffectWindowGroupD1Ev@Base 4:5.1.95+git20150122
++ _ZN4KWin17EffectWindowGroupD2Ev@Base 4:5.1.95+git20150122
++ _ZN4KWin18WindowPrePaintData14setTransformedEv@Base 4:5.1.95+git20150122
++ _ZN4KWin18WindowPrePaintData14setTranslucentEv@Base 4:5.1.95+git20150122
++ _ZN4KWin19EffectPluginFactory11qt_metacallEN11QMetaObject4CallEiPPv@Base 4:5.1.95+git20150122
++ _ZN4KWin19EffectPluginFactory11qt_metacastEPKc@Base 4:5.1.95+git20150122
++ _ZN4KWin19EffectPluginFactory16staticMetaObjectE@Base 4:5.1.95+git20150122
++ _ZN4KWin19EffectPluginFactoryC1Ev@Base 4:5.1.95+git20150122
++ _ZN4KWin19EffectPluginFactoryC2Ev@Base 4:5.1.95+git20150122
++ _ZN4KWin19EffectPluginFactoryD0Ev@Base 4:5.1.95+git20150122
++ _ZN4KWin19EffectPluginFactoryD1Ev@Base 4:5.1.95+git20150122
++ _ZN4KWin19EffectPluginFactoryD2Ev@Base 4:5.1.95+git20150122
++ _ZN4KWin19WindowMotionManager10moveWindowEPNS_12EffectWindowE6QPointdd@Base 4:5.1.95+git20150122
++ _ZN4KWin19WindowMotionManager11unmanageAllEv@Base 4:5.1.95+git20150122
++ _ZN4KWin19WindowMotionManager22setTransformedGeometryEPNS_12EffectWindowERK6QRectF@Base 4:5.1.95+git20150122
++ _ZN4KWin19WindowMotionManager5applyEPNS_12EffectWindowERNS_15WindowPaintDataE@Base 4:5.1.95+git20150122
++ _ZN4KWin19WindowMotionManager5resetEPNS_12EffectWindowE@Base 4:5.1.95+git20150122
++ _ZN4KWin19WindowMotionManager5resetEv@Base 4:5.1.95+git20150122
++ _ZN4KWin19WindowMotionManager6manageEPNS_12EffectWindowE@Base 4:5.1.95+git20150122
++ _ZN4KWin19WindowMotionManager8unmanageEPNS_12EffectWindowE@Base 4:5.1.95+git20150122
++ _ZN4KWin19WindowMotionManager9calculateEi@Base 4:5.1.95+git20150122
++ _ZN4KWin19WindowMotionManagerC1Eb@Base 4:5.1.95+git20150122
++ _ZN4KWin19WindowMotionManagerC2Eb@Base 4:5.1.95+git20150122
++ _ZN4KWin19WindowMotionManagerD1Ev@Base 4:5.1.95+git20150122
++ _ZN4KWin19WindowMotionManagerD2Ev@Base 4:5.1.95+git20150122
++ _ZN4KWin6Effect10buildQuadsEPNS_12EffectWindowERNS_14WindowQuadListE@Base 4:5.1.95+git20150122
++ _ZN4KWin6Effect10drawWindowEPNS_12EffectWindowEi7QRegionRNS_15WindowPaintDataE@Base 4:5.1.95+git20150122
++ _ZN4KWin6Effect11paintScreenEi7QRegionRNS_15ScreenPaintDataE@Base 4:5.1.95+git20150122
++ _ZN4KWin6Effect11paintWindowEPNS_12EffectWindowEi7QRegionRNS_15WindowPaintDataE@Base 4:5.1.95+git20150122
++ _ZN4KWin6Effect11qt_metacallEN11QMetaObject4CallEiPPv@Base 4:5.1.95+git20150122
++ _ZN4KWin6Effect11qt_metacastEPKc@Base 4:5.1.95+git20150122
++ _ZN4KWin6Effect11reconfigureE6QFlagsINS0_15ReconfigureFlagEE@Base 4:5.1.95+git20150122
++ _ZN4KWin6Effect11touchMotionEjRK7QPointFj@Base 4:5.7.2+git20160823
++ _ZN4KWin6Effect13animationTimeERK12KConfigGroupRK7QStringi@Base 4:5.1.95+git20150122
++ _ZN4KWin6Effect13animationTimeEi@Base 4:5.1.95+git20150122
++ _ZN4KWin6Effect14prePaintScreenERNS_18ScreenPrePaintDataEi@Base 4:5.1.95+git20150122
++ _ZN4KWin6Effect14prePaintWindowEPNS_12EffectWindowERNS_18WindowPrePaintDataEi@Base 4:5.1.95+git20150122
++ _ZN4KWin6Effect15borderActivatedENS_14ElectricBorderE@Base 4:5.1.95+git20150122
++ _ZN4KWin6Effect15postPaintScreenEv@Base 4:5.1.95+git20150122
++ _ZN4KWin6Effect15postPaintWindowEPNS_12EffectWindowE@Base 4:5.1.95+git20150122
++ _ZN4KWin6Effect16paintEffectFrameEPNS_11EffectFrameE7QRegiondd@Base 4:5.1.95+git20150122
++ _ZN4KWin6Effect16staticMetaObjectE@Base 4:5.1.95+git20150122
++ _ZN4KWin6Effect20grabbedKeyboardEventEP9QKeyEvent@Base 4:5.1.95+git20150122
++ _ZN4KWin6Effect21windowInputMouseEventEP6QEvent@Base 4:5.1.95+git20150122
++ _ZN4KWin6Effect26setPositionTransformationsERNS_15WindowPaintDataER5QRectPNS_12EffectWindowERKS3_N2Qt15AspectRatioModeE@Base 4:5.1.95+git20150122
++ _ZN4KWin6Effect5proxyEv@Base 4:5.1.95+git20150122
++ _ZN4KWin6Effect7performENS0_7FeatureERK5QListI8QVariantE@Base 4:5.7.5+git20161020
++ _ZN4KWin6Effect7touchUpEjj@Base 4:5.7.2+git20160823
++ _ZN4KWin6Effect8providesENS0_7FeatureE@Base 4:5.1.95+git20150122
++ _ZN4KWin6Effect9cursorPosEv@Base 4:5.1.95+git20150122
++ _ZN4KWin6Effect9touchDownEjRK7QPointFj@Base 4:5.7.2+git20160823
++ _ZN4KWin6EffectC1Ev@Base 4:5.1.95+git20150122
++ _ZN4KWin6EffectC2Ev@Base 4:5.1.95+git20150122
++ _ZN4KWin6EffectD0Ev@Base 4:5.1.95+git20150122
++ _ZN4KWin6EffectD1Ev@Base 4:5.1.95+git20150122
++ _ZN4KWin6EffectD2Ev@Base 4:5.1.95+git20150122
++ (optional=templinst)_ZN4KWin6MotionI7QPointFE9calculateEi@Base 4:5.1.95+git20150122
++ (optional=templinst|arch=armhf)_ZN4KWin6MotionI7QPointFEC1ERKS2_@Base 4:5.9.0
++ (optional=templinst|arch=armhf)_ZN4KWin6MotionI7QPointFEC2ERKS2_@Base 4:5.9.0
++ _ZN4KWin7AniDataC1ENS_15AnimationEffect9AttributeEiRKNS_4FPx2EiS5_b14QSharedPointerINS_20FullScreenEffectLockEEbS6_INS_24PreviousWindowPixmapLockEE@Base 4:5.14.80+git20181230
++ _ZN4KWin7AniDataC1Ev@Base 4:5.13.90
++ _ZN4KWin7AniDataC2ENS_15AnimationEffect9AttributeEiRKNS_4FPx2EiS5_b14QSharedPointerINS_20FullScreenEffectLockEEbS6_INS_24PreviousWindowPixmapLockEE@Base 4:5.14.80+git20181230
++ _ZN4KWin7AniDataC2Ev@Base 4:5.13.90
++ _ZN4KWin7effectsE@Base 4:5.1.95+git20150122
++ _ZN4KWin8Motion1DC1ERKS0_@Base 4:5.1.95+git20150122
++ _ZN4KWin8Motion1DC1Eddd@Base 4:5.1.95+git20150122
++ _ZN4KWin8Motion1DC2ERKS0_@Base 4:5.1.95+git20150122
++ _ZN4KWin8Motion1DC2Eddd@Base 4:5.1.95+git20150122
++ _ZN4KWin8Motion1DD1Ev@Base 4:5.1.95+git20150122
++ _ZN4KWin8Motion1DD2Ev@Base 4:5.1.95+git20150122
++ _ZN4KWin8Motion2DC1E7QPointFdd@Base 4:5.1.95+git20150122
++ _ZN4KWin8Motion2DC1ERKS0_@Base 4:5.1.95+git20150122
++ _ZN4KWin8Motion2DC2E7QPointFdd@Base 4:5.1.95+git20150122
++ _ZN4KWin8Motion2DC2ERKS0_@Base 4:5.1.95+git20150122
++ _ZN4KWin8Motion2DD1Ev@Base 4:5.1.95+git20150122
++ _ZN4KWin8Motion2DD2Ev@Base 4:5.1.95+git20150122
++ (subst)_ZN4KWin8TimeLine10setElapsedENSt6chrono8durationI{int64_t}St5ratioIL{int64_t}1EL{int64_t}1000EEEE@Base 4:5.13.90
++ (subst)_ZN4KWin8TimeLine11setDurationENSt6chrono8durationI{int64_t}St5ratioIL{int64_t}1EL{int64_t}1000EEEE@Base 4:5.13.90
++ _ZN4KWin8TimeLine12setDirectionENS0_9DirectionE@Base 4:5.13.90
++ _ZN4KWin8TimeLine14setEasingCurveEN12QEasingCurve4TypeE@Base 4:5.13.90
++ _ZN4KWin8TimeLine14setEasingCurveERK12QEasingCurve@Base 4:5.13.90
++ _ZN4KWin8TimeLine15toggleDirectionEv@Base 4:5.13.90
++ _ZN4KWin8TimeLine21setSourceRedirectModeENS0_12RedirectModeE@Base 4:5.14.80+git20181230
++ _ZN4KWin8TimeLine21setTargetRedirectModeENS0_12RedirectModeE@Base 4:5.14.80+git20181230
++ _ZN4KWin8TimeLine5resetEv@Base 4:5.13.90
++ (subst)_ZN4KWin8TimeLine6updateENSt6chrono8durationI{int64_t}St5ratioIL{int64_t}1EL{int64_t}1000EEEE@Base 4:5.13.90
++ (subst)_ZN4KWin8TimeLineC1ENSt6chrono8durationI{int64_t}St5ratioIL{int64_t}1EL{int64_t}1000EEEENS0_9DirectionE@Base 4:5.13.90
++ _ZN4KWin8TimeLineC1ERKS0_@Base 4:5.13.90
++ (subst)_ZN4KWin8TimeLineC2ENSt6chrono8durationI{int64_t}St5ratioIL{int64_t}1EL{int64_t}1000EEEENS0_9DirectionE@Base 4:5.13.90
++ _ZN4KWin8TimeLineC2ERKS0_@Base 4:5.13.90
++ _ZN4KWin8TimeLineD1Ev@Base 4:5.13.90
++ _ZN4KWin8TimeLineD2Ev@Base 4:5.13.90
++ _ZN4KWin8TimeLineaSERKS0_@Base 4:5.13.90
++ _ZN4KWin9PaintData15setRotationAxisEN2Qt4AxisE@Base 4:5.1.95+git20150122
++ _ZN4KWin9PaintData15setRotationAxisERK9QVector3D@Base 4:5.1.95+git20150122
++ _ZN4KWin9PaintData15setXTranslationEd@Base 4:5.1.95+git20150122
++ _ZN4KWin9PaintData15setYTranslationEd@Base 4:5.1.95+git20150122
++ _ZN4KWin9PaintData15setZTranslationEd@Base 4:5.1.95+git20150122
++ _ZN4KWin9PaintData16setRotationAngleEd@Base 4:5.1.95+git20150122
++ _ZN4KWin9PaintData17setRotationOriginERK9QVector3D@Base 4:5.1.95+git20150122
++ _ZN4KWin9PaintData8setScaleERK9QVector2D@Base 4:5.1.95+git20150122
++ _ZN4KWin9PaintData8setScaleERK9QVector3D@Base 4:5.1.95+git20150122
++ _ZN4KWin9PaintData9setXScaleEd@Base 4:5.1.95+git20150122
++ _ZN4KWin9PaintData9setYScaleEd@Base 4:5.1.95+git20150122
++ _ZN4KWin9PaintData9setZScaleEd@Base 4:5.1.95+git20150122
++ _ZN4KWin9PaintData9translateERK9QVector3D@Base 4:5.1.95+git20150122
++ _ZN4KWin9PaintData9translateEddd@Base 4:5.1.95+git20150122
++ _ZN4KWin9PaintDataC1Ev@Base 4:5.1.95+git20150122
++ _ZN4KWin9PaintDataC2Ev@Base 4:5.1.95+git20150122
++ _ZN4KWin9PaintDataD0Ev@Base 4:5.1.95+git20150122
++ _ZN4KWin9PaintDataD1Ev@Base 4:5.1.95+git20150122
++ _ZN4KWin9PaintDataD2Ev@Base 4:5.1.95+git20150122
++ _ZNK4KWin10WindowQuad11makeSubQuadEdddd@Base 4:5.1.95+git20150122
++ _ZNK4KWin10WindowQuad12smoothNeededEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin11EffectFrame11isCrossFadeEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin11EffectFrame17crossFadeProgressEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin11EffectFrame22screenProjectionMatrixEv@Base 4:5.6.3
++ _ZNK4KWin12EffectWindow10metaObjectEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin12EffectWindow11isOnDesktopEi@Base 4:5.1.95+git20150122
++ _ZNK4KWin12EffectWindow12isOnActivityE7QString@Base 4:5.1.95+git20150122
++ _ZNK4KWin12EffectWindow13hasDecorationEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin12EffectWindow15isOnAllDesktopsEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin12EffectWindow17isOnAllActivitiesEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin12EffectWindow18isOnCurrentDesktopEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin12EffectWindow19isOnCurrentActivityEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin12EffectWindow9isVisibleEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin12PaintClipper8Iterator12boundingRectEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin14EffectsHandler10metaObjectEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin14EffectsHandler15compositingTypeEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin14EffectsHandler19isOpenGLCompositingEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin14WindowQuadList10makeArraysEPPfS2_RK6QSizeFb@Base 4:5.1.95+git20150122
++ _ZNK4KWin14WindowQuadList12smoothNeededEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin14WindowQuadList13isTransformedEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin14WindowQuadList15makeRegularGridEii@Base 4:5.1.95+git20150122
++ _ZNK4KWin14WindowQuadList21makeInterleavedArraysEjPNS_10GLVertex2DERK10QMatrix4x4@Base 4:5.1.95+git20150122
++ _ZNK4KWin14WindowQuadList6selectENS_14WindowQuadTypeE@Base 4:5.1.95+git20150122
++ _ZNK4KWin14WindowQuadList8makeGridEi@Base 4:5.1.95+git20150122
++ _ZNK4KWin14WindowQuadList8splitAtXEd@Base 4:5.1.95+git20150122
++ _ZNK4KWin14WindowQuadList8splitAtYEd@Base 4:5.1.95+git20150122
++ _ZNK4KWin14WindowQuadList9filterOutENS_14WindowQuadTypeE@Base 4:5.1.95+git20150122
++ _ZNK4KWin15AnimationEffect10clipWindowEPKNS_12EffectWindowERKNS_7AniDataERNS_14WindowQuadListE@Base 4:5.1.95+git20150122
++ _ZNK4KWin15AnimationEffect10metaObjectEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin15AnimationEffect12interpolatedERKNS_7AniDataEi@Base 4:5.1.95+git20150122
++ _ZNK4KWin15AnimationEffect5debugERK7QString@Base 4:5.1.95+git20150122
++ _ZNK4KWin15AnimationEffect5stateEv@Base 4:5.13.90
++ _ZNK4KWin15AnimationEffect8clipRectERK5QRectRKNS_7AniDataE@Base 4:5.1.95+git20150122
++ _ZNK4KWin15AnimationEffect8isActiveEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin15AnimationEffect8progressERKNS_7AniDataE@Base 4:5.1.95+git20150122
++ _ZNK4KWin15AnimationEffect8validateENS0_9AttributeERjPNS_4FPx2ES4_PKNS_12EffectWindowE@Base 4:5.6.3
++ _ZNK4KWin15ScreenPaintData14outputGeometryEv@Base 4:5.7.5+git20161020
++ _ZNK4KWin15ScreenPaintData16projectionMatrixEv@Base 4:5.6.3
++ _ZNK4KWin15WindowPaintData10brightnessEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin15WindowPaintData10saturationEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin15WindowPaintData13setSaturationEd@Base 4:5.1.95+git20150122
++ _ZNK4KWin15WindowPaintData15modelViewMatrixEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin15WindowPaintData16projectionMatrixEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin15WindowPaintData17crossFadeProgressEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin15WindowPaintData22screenProjectionMatrixEv@Base 4:5.6.3
++ _ZNK4KWin15WindowPaintData6screenEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin15WindowPaintData7opacityEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin15WindowPaintData9setScreenEi@Base 4:5.1.95+git20150122
++ _ZNK4KWin19EffectPluginFactory10metaObjectEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin19EffectPluginFactory11isSupportedEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin19EffectPluginFactory16enabledByDefaultEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin19WindowMotionManager13windowAtPointE6QPointb@Base 4:5.1.95+git20150122
++ _ZNK4KWin19WindowMotionManager14targetGeometryEPNS_12EffectWindowE@Base 4:5.1.95+git20150122
++ _ZNK4KWin19WindowMotionManager19transformedGeometryEPNS_12EffectWindowE@Base 4:5.1.95+git20150122
++ _ZNK4KWin6Effect10metaObjectEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin6Effect13x11RootWindowEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin6Effect13xcbConnectionEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin6Effect28requestedEffectChainPositionEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin6Effect5debugERK7QString@Base 4:5.1.95+git20150122
++ _ZNK4KWin6Effect8isActiveEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin7AniData8isActiveEv@Base 4:5.14.80+git20181230
++ _ZNK4KWin7AniData9debugInfoEv@Base 4:5.13.90
++ _ZNK4KWin8TimeLine11easingCurveEv@Base 4:5.13.90
++ _ZNK4KWin8TimeLine18sourceRedirectModeEv@Base 4:5.14.80+git20181230
++ _ZNK4KWin8TimeLine18targetRedirectModeEv@Base 4:5.14.80+git20181230
++ _ZNK4KWin8TimeLine4doneEv@Base 4:5.13.90
++ _ZNK4KWin8TimeLine5valueEv@Base 4:5.13.90
++ _ZNK4KWin8TimeLine7elapsedEv@Base 4:5.13.90
++ _ZNK4KWin8TimeLine7runningEv@Base 4:5.13.90
++ _ZNK4KWin8TimeLine8durationEv@Base 4:5.13.90
++ _ZNK4KWin8TimeLine8progressEv@Base 4:5.13.90
++ _ZNK4KWin8TimeLine9directionEv@Base 4:5.13.90
++ _ZNK4KWin9PaintData11translationEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin9PaintData12rotationAxisEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin9PaintData12xTranslationEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin9PaintData12yTranslationEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin9PaintData12zTranslationEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin9PaintData13rotationAngleEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin9PaintData14rotationOriginEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin9PaintData5scaleEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin9PaintData6xScaleEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin9PaintData6yScaleEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin9PaintData6zScaleEv@Base 4:5.1.95+git20150122
++ _ZTIN4KWin11EffectFrameE@Base 4:5.1.95+git20150122
++ _ZTIN4KWin12EffectWindowE@Base 4:5.1.95+git20150122
++ _ZTIN4KWin14EffectsHandlerE@Base 4:5.1.95+git20150122
++ _ZTIN4KWin15AnimationEffectE@Base 4:5.1.95+git20150122
++ _ZTIN4KWin15ScreenPaintDataE@Base 4:5.1.95+git20150122
++ _ZTIN4KWin15WindowPaintDataE@Base 4:5.1.95+git20150122
++ _ZTIN4KWin17EffectWindowGroupE@Base 4:5.1.95+git20150122
++ _ZTIN4KWin19EffectPluginFactoryE@Base 4:5.1.95+git20150122
++ _ZTIN4KWin6EffectE@Base 4:5.1.95+git20150122
++ _ZTIN4KWin9PaintDataE@Base 4:5.1.95+git20150122
++ _ZTSN4KWin11EffectFrameE@Base 4:5.1.95+git20150122
++ _ZTSN4KWin12EffectWindowE@Base 4:5.1.95+git20150122
++ _ZTSN4KWin14EffectsHandlerE@Base 4:5.1.95+git20150122
++ _ZTSN4KWin15AnimationEffectE@Base 4:5.1.95+git20150122
++ _ZTSN4KWin15ScreenPaintDataE@Base 4:5.1.95+git20150122
++ _ZTSN4KWin15WindowPaintDataE@Base 4:5.1.95+git20150122
++ _ZTSN4KWin17EffectWindowGroupE@Base 4:5.1.95+git20150122
++ _ZTSN4KWin19EffectPluginFactoryE@Base 4:5.1.95+git20150122
++ _ZTSN4KWin6EffectE@Base 4:5.1.95+git20150122
++ _ZTSN4KWin9PaintDataE@Base 4:5.1.95+git20150122
++ _ZTVN4KWin11EffectFrameE@Base 4:5.1.95+git20150122
++ _ZTVN4KWin12EffectWindowE@Base 4:5.1.95+git20150122
++ _ZTVN4KWin14EffectsHandlerE@Base 4:5.1.95+git20150122
++ _ZTVN4KWin15AnimationEffectE@Base 4:5.1.95+git20150122
++ _ZTVN4KWin15ScreenPaintDataE@Base 4:5.1.95+git20150122
++ _ZTVN4KWin15WindowPaintDataE@Base 4:5.1.95+git20150122
++ _ZTVN4KWin17EffectWindowGroupE@Base 4:5.1.95+git20150122
++ _ZTVN4KWin19EffectPluginFactoryE@Base 4:5.1.95+git20150122
++ _ZTVN4KWin6EffectE@Base 4:5.1.95+git20150122
++ _ZTVN4KWin9PaintDataE@Base 4:5.1.95+git20150122
++ _ZZN4KWin10connectionEvE5s_con@Base 4:5.1.95+git20150122
+diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/debian/libkwinglutils12.install kwin/debian/libkwinglutils12.install
+--- kwin-5.15.5/debian/libkwinglutils12.install	1969-12-31 19:00:00.000000000 -0500
++++ kwin/debian/libkwinglutils12.install	2019-06-12 14:39:30.172877515 -0500
+@@ -0,0 +1,2 @@
++usr/lib/*/libkwingl*utils.so.12
++usr/lib/*/libkwingl*utils.so.5.*
+diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/debian/libkwinglutils12.symbols kwin/debian/libkwinglutils12.symbols
+--- kwin-5.15.5/debian/libkwinglutils12.symbols	1969-12-31 19:00:00.000000000 -0500
++++ kwin/debian/libkwinglutils12.symbols	2019-06-12 14:39:30.172877515 -0500
+@@ -0,0 +1,245 @@
++# SymbolsHelper-Confirmed: 4:5.12.90 amd64
++libkwinglutils.so.12 libkwinglutils12 #MINVER#
++ _ZN4KWin10GLPlatform10s_platformE@Base 4:5.1.95+git20150122
++ _ZN4KWin10GLPlatform14driverToStringENS_6DriverE@Base 4:5.1.95+git20150122
++ _ZN4KWin10GLPlatform15driverToString8ENS_6DriverE@Base 4:5.5.1
++ _ZN4KWin10GLPlatform15versionToStringEx@Base 4:5.1.95+git20150122
++ _ZN4KWin10GLPlatform16versionToString8Ex@Base 4:5.5.1
++ _ZN4KWin10GLPlatform17chipClassToStringENS_9ChipClassE@Base 4:5.1.95+git20150122
++ _ZN4KWin10GLPlatform18chipClassToString8ENS_9ChipClassE@Base 4:5.5.1
++ _ZN4KWin10GLPlatform6detectENS_23OpenGLPlatformInterfaceE@Base 4:5.1.95+git20150122
++ _ZN4KWin10GLPlatform7cleanupEv@Base 4:5.1.95+git20150122
++ _ZN4KWin10GLPlatformC1Ev@Base 4:5.1.95+git20150122
++ _ZN4KWin10GLPlatformC2Ev@Base 4:5.1.95+git20150122
++ _ZN4KWin10GLPlatformD1Ev@Base 4:5.1.95+git20150122
++ _ZN4KWin10GLPlatformD2Ev@Base 4:5.1.95+git20150122
++ _ZN4KWin12checkGLErrorEPKc@Base 4:5.1.95+git20150122
++ _ZN4KWin12hasGLVersionEiii@Base 4:5.1.95+git20150122
++ _ZN4KWin13ShaderManager10pushShaderE6QFlagsINS_11ShaderTraitEE@Base 4:5.1.95+git20150122
++ _ZN4KWin13ShaderManager10pushShaderEPNS_8GLShaderE@Base 4:5.1.95+git20150122
++ _ZN4KWin13ShaderManager14generateShaderE6QFlagsINS_11ShaderTraitEE@Base 4:5.1.95+git20150122
++ _ZN4KWin13ShaderManager15s_shaderManagerE@Base 4:5.1.95+git20150122
++ _ZN4KWin13ShaderManager18loadShaderFromCodeERK10QByteArrayS3_@Base 4:5.1.95+git20150122
++ _ZN4KWin13ShaderManager20generateCustomShaderE6QFlagsINS_11ShaderTraitEERK10QByteArrayS6_@Base 4:5.6.3
++ _ZN4KWin13ShaderManager21bindFragDataLocationsEPNS_8GLShaderE@Base 4:5.1.95+git20150122
++ _ZN4KWin13ShaderManager27generateShaderFromResourcesE6QFlagsINS_11ShaderTraitEERK7QStringS6_@Base 4:5.6.3
++ _ZN4KWin13ShaderManager6shaderE6QFlagsINS_11ShaderTraitEE@Base 4:5.1.95+git20150122
++ _ZN4KWin13ShaderManager7cleanupEv@Base 4:5.1.95+git20150122
++ _ZN4KWin13ShaderManager8instanceEv@Base 4:5.1.95+git20150122
++ _ZN4KWin13ShaderManager8selfTestEv@Base 4:5.1.95+git20150122
++ _ZN4KWin13ShaderManager9popShaderEv@Base 4:5.1.95+git20150122
++ _ZN4KWin13ShaderManagerC1Ev@Base 4:5.1.95+git20150122
++ _ZN4KWin13ShaderManagerC2Ev@Base 4:5.1.95+git20150122
++ _ZN4KWin13ShaderManagerD1Ev@Base 4:5.1.95+git20150122
++ _ZN4KWin13ShaderManagerD2Ev@Base 4:5.1.95+git20150122
++ _ZN4KWin14GLRenderTarget10initStaticEv@Base 4:5.1.95+git20150122
++ _ZN4KWin14GLRenderTarget10sSupportedE@Base 4:5.1.95+git20150122
++ _ZN4KWin14GLRenderTarget13attachTextureERKNS_9GLTextureE@Base 4:5.1.95+git20150122
++ _ZN4KWin14GLRenderTarget13blitSupportedEv@Base 4:5.1.95+git20150122
++ _ZN4KWin14GLRenderTarget13detachTextureEv@Base 4:5.12.90
++ _ZN4KWin14GLRenderTarget15popRenderTargetEv@Base 4:5.1.95+git20150122
++ _ZN4KWin14GLRenderTarget15s_blitSupportedE@Base 4:5.1.95+git20150122
++ _ZN4KWin14GLRenderTarget15s_renderTargetsE@Base 4:5.1.95+git20150122
++ _ZN4KWin14GLRenderTarget16pushRenderTargetEPS0_@Base 4:5.1.95+git20150122
++ _ZN4KWin14GLRenderTarget17pushRenderTargetsE6QStackIPS0_E@Base 4:5.12.90
++ _ZN4KWin14GLRenderTarget19blitFromFramebufferERK5QRectS3_j@Base 4:5.1.95+git20150122
++ _ZN4KWin14GLRenderTarget19isRenderTargetBoundEv@Base 4:5.1.95+git20150122
++ _ZN4KWin14GLRenderTarget19s_virtualScreenSizeE@Base 4:5.1.95+git20150122
++ _ZN4KWin14GLRenderTarget20s_virtualScreenScaleE@Base 4:5.9.95
++ _ZN4KWin14GLRenderTarget23s_virtualScreenGeometryE@Base 4:5.7.5+git20161020
++ _ZN4KWin14GLRenderTarget23s_virtualScreenViewportE@Base 4:5.9.95
++ _ZN4KWin14GLRenderTarget6enableEv@Base 4:5.1.95+git20150122
++ _ZN4KWin14GLRenderTarget7cleanupEv@Base 4:5.1.95+git20150122
++ _ZN4KWin14GLRenderTarget7disableEv@Base 4:5.1.95+git20150122
++ _ZN4KWin14GLRenderTarget7initFBOEv@Base 4:5.1.95+git20150122
++ _ZN4KWin14GLRenderTargetC1ERKNS_9GLTextureE@Base 4:5.1.95+git20150122
++ _ZN4KWin14GLRenderTargetC1Ev@Base 4:5.12.90
++ _ZN4KWin14GLRenderTargetC2ERKNS_9GLTextureE@Base 4:5.1.95+git20150122
++ _ZN4KWin14GLRenderTargetC2Ev@Base 4:5.12.90
++ _ZN4KWin14GLRenderTargetD1Ev@Base 4:5.1.95+git20150122
++ _ZN4KWin14GLRenderTargetD2Ev@Base 4:5.1.95+git20150122
++ _ZN4KWin14GLVertexBuffer10bindArraysEv@Base 4:5.1.95+git20150122
++ _ZN4KWin14GLVertexBuffer10endOfFrameEv@Base 4:5.1.95+git20150122
++ _ZN4KWin14GLVertexBuffer10initStaticEv@Base 4:5.1.95+git20150122
++ _ZN4KWin14GLVertexBuffer11framePostedEv@Base 4:5.1.95+git20150122
++ _ZN4KWin14GLVertexBuffer11setUseColorEb@Base 4:5.1.95+git20150122
++ _ZN4KWin14GLVertexBuffer12unbindArraysEv@Base 4:5.1.95+git20150122
++ _ZN4KWin14GLVertexBuffer14setVertexCountEi@Base 4:5.1.95+git20150122
++ _ZN4KWin14GLVertexBuffer15setAttribLayoutEPKNS_14GLVertexAttribEii@Base 4:5.1.95+git20150122
++ _ZN4KWin14GLVertexBuffer15streamingBufferEv@Base 4:5.1.95+git20150122
++ _ZN4KWin14GLVertexBuffer20s_virtualScreenScaleE@Base 4:5.11.2+git20171029
++ _ZN4KWin14GLVertexBuffer20supportsIndexedQuadsEv@Base 4:5.1.95+git20150122
++ _ZN4KWin14GLVertexBuffer23s_virtualScreenGeometryE@Base 4:5.7.5+git20161020
++ (subst)_ZN4KWin14GLVertexBuffer3mapE{size_t}@Base 4:5.1.95+git20150122
++ _ZN4KWin14GLVertexBuffer4drawERK7QRegionjiib@Base 4:5.1.95+git20150122
++ _ZN4KWin14GLVertexBuffer4drawEjii@Base 4:5.1.95+git20150122
++ _ZN4KWin14GLVertexBuffer5resetEv@Base 4:5.1.95+git20150122
++ _ZN4KWin14GLVertexBuffer5unmapEv@Base 4:5.1.95+git20150122
++ _ZN4KWin14GLVertexBuffer6renderERK7QRegionjb@Base 4:5.1.95+git20150122
++ _ZN4KWin14GLVertexBuffer6renderEj@Base 4:5.1.95+git20150122
++ _ZN4KWin14GLVertexBuffer7cleanupEv@Base 4:5.1.95+git20150122
++ (subst)_ZN4KWin14GLVertexBuffer7setDataEPKv{size_t}@Base 4:5.1.95+git20150122
++ _ZN4KWin14GLVertexBuffer7setDataEiiPKfS2_@Base 4:5.1.95+git20150122
++ _ZN4KWin14GLVertexBuffer8setColorERK6QColorb@Base 4:5.1.95+git20150122
++ _ZN4KWin14GLVertexBufferC1ENS0_9UsageHintE@Base 4:5.1.95+git20150122
++ _ZN4KWin14GLVertexBufferC2ENS0_9UsageHintE@Base 4:5.1.95+git20150122
++ _ZN4KWin14GLVertexBufferD1Ev@Base 4:5.1.95+git20150122
++ _ZN4KWin14GLVertexBufferD2Ev@Base 4:5.1.95+git20150122
++ _ZN4KWin14hasGLExtensionERK10QByteArray@Base 4:5.1.95+git20150122
++ _ZN4KWin16GLTexturePrivate10initStaticEv@Base 4:5.1.95+git20150122
++ _ZN4KWin16GLTexturePrivate12updateMatrixEv@Base 4:5.1.95+git20150122
++ _ZN4KWin16GLTexturePrivate16s_supportsARGB32E@Base 4:5.1.95+git20150122
++ _ZN4KWin16GLTexturePrivate16s_supportsUnpackE@Base 4:5.1.95+git20150122
++ _ZN4KWin16GLTexturePrivate22s_textureObjectCounterE@Base 4:5.1.95+git20150122
++ _ZN4KWin16GLTexturePrivate24s_supportsTextureStorageE@Base 4:5.1.95+git20150122
++ _ZN4KWin16GLTexturePrivate24s_supportsTextureSwizzleE@Base 4:5.1.95+git20150122
++ _ZN4KWin16GLTexturePrivate25s_supportsTextureFormatRGE@Base 4:5.2.1
++ _ZN4KWin16GLTexturePrivate28s_supportsFramebufferObjectsE@Base 4:5.1.95+git20150122
++ _ZN4KWin16GLTexturePrivate5s_fboE@Base 4:5.1.95+git20150122
++ _ZN4KWin16GLTexturePrivate7cleanupEv@Base 4:5.1.95+git20150122
++ _ZN4KWin16GLTexturePrivate8onDamageEv@Base 4:5.1.95+git20150122
++ _ZN4KWin16GLTexturePrivateC1Ev@Base 4:5.1.95+git20150122
++ _ZN4KWin16GLTexturePrivateC2Ev@Base 4:5.1.95+git20150122
++ _ZN4KWin16GLTexturePrivateD0Ev@Base 4:5.1.95+git20150122
++ _ZN4KWin16GLTexturePrivateD1Ev@Base 4:5.1.95+git20150122
++ _ZN4KWin16GLTexturePrivateD2Ev@Base 4:5.1.95+git20150122
++ _ZN4KWin16openGLExtensionsEv@Base 4:5.7.2+git20160823
++ _ZN4KWin18glResolveFunctionsESt8functionIFPFvvEPKcEE@Base 4:5.9.0
++ _ZN4KWin19epoxy_glReadnPixelsE@Base 4:5.4.0
++ _ZN4KWin21epoxy_glGetnUniformfvE@Base 4:5.4.0
++ _ZN4KWin30epoxy_glGetGraphicsResetStatusE@Base 4:5.4.0
++ _ZN4KWin6initGLESt8functionIFPFvvEPKcEE@Base 4:5.9.0
++ _ZN4KWin8GLShader10setUniformENS0_10IntUniformEi@Base 4:5.1.95+git20150122
++ _ZN4KWin8GLShader10setUniformENS0_11Vec2UniformERK9QVector2D@Base 4:5.1.95+git20150122
++ _ZN4KWin8GLShader10setUniformENS0_11Vec4UniformERK9QVector4D@Base 4:5.1.95+git20150122
++ _ZN4KWin8GLShader10setUniformENS0_12ColorUniformERK6QColor@Base 4:5.1.95+git20150122
++ _ZN4KWin8GLShader10setUniformENS0_12ColorUniformERK9QVector4D@Base 4:5.1.95+git20150122
++ _ZN4KWin8GLShader10setUniformENS0_12FloatUniformEf@Base 4:5.1.95+git20150122
++ _ZN4KWin8GLShader10setUniformENS0_13MatrixUniformERK10QMatrix4x4@Base 4:5.1.95+git20150122
++ _ZN4KWin8GLShader10setUniformEPKcRK10QMatrix4x4@Base 4:5.1.95+git20150122
++ _ZN4KWin8GLShader10setUniformEPKcRK6QColor@Base 4:5.1.95+git20150122
++ _ZN4KWin8GLShader10setUniformEPKcRK9QVector2D@Base 4:5.1.95+git20150122
++ _ZN4KWin8GLShader10setUniformEPKcRK9QVector3D@Base 4:5.1.95+git20150122
++ _ZN4KWin8GLShader10setUniformEPKcRK9QVector4D@Base 4:5.1.95+git20150122
++ _ZN4KWin8GLShader10setUniformEPKcf@Base 4:5.1.95+git20150122
++ _ZN4KWin8GLShader10setUniformEPKci@Base 4:5.1.95+git20150122
++ _ZN4KWin8GLShader10setUniformEiRK10QMatrix4x4@Base 4:5.1.95+git20150122
++ _ZN4KWin8GLShader10setUniformEiRK6QColor@Base 4:5.1.95+git20150122
++ _ZN4KWin8GLShader10setUniformEiRK9QVector2D@Base 4:5.1.95+git20150122
++ _ZN4KWin8GLShader10setUniformEiRK9QVector3D@Base 4:5.1.95+git20150122
++ _ZN4KWin8GLShader10setUniformEiRK9QVector4D@Base 4:5.1.95+git20150122
++ _ZN4KWin8GLShader10setUniformEif@Base 4:5.1.95+git20150122
++ _ZN4KWin8GLShader10setUniformEii@Base 4:5.1.95+git20150122
++ _ZN4KWin8GLShader12setAttributeEPKcf@Base 4:5.1.95+git20150122
++ _ZN4KWin8GLShader13loadFromFilesERK7QStringS3_@Base 4:5.1.95+git20150122
++ _ZN4KWin8GLShader15uniformLocationEPKc@Base 4:5.1.95+git20150122
++ _ZN4KWin8GLShader16resolveLocationsEv@Base 4:5.1.95+git20150122
++ _ZN4KWin8GLShader17attributeLocationEPKc@Base 4:5.1.95+git20150122
++ _ZN4KWin8GLShader19getUniformMatrix4x4EPKc@Base 4:5.1.95+git20150122
++ _ZN4KWin8GLShader20bindFragDataLocationEPKci@Base 4:5.1.95+git20150122
++ _ZN4KWin8GLShader21bindAttributeLocationEPKci@Base 4:5.1.95+git20150122
++ _ZN4KWin8GLShader4bindEv@Base 4:5.1.95+git20150122
++ _ZN4KWin8GLShader4linkEv@Base 4:5.1.95+git20150122
++ _ZN4KWin8GLShader4loadERK10QByteArrayS3_@Base 4:5.1.95+git20150122
++ _ZN4KWin8GLShader6unbindEv@Base 4:5.1.95+git20150122
++ _ZN4KWin8GLShaderC1ERK7QStringS3_j@Base 4:5.1.95+git20150122
++ _ZN4KWin8GLShaderC1Ej@Base 4:5.1.95+git20150122
++ _ZN4KWin8GLShaderC2ERK7QStringS3_j@Base 4:5.1.95+git20150122
++ _ZN4KWin8GLShaderC2Ej@Base 4:5.1.95+git20150122
++ _ZN4KWin8GLShaderD1Ev@Base 4:5.1.95+git20150122
++ _ZN4KWin8GLShaderD2Ev@Base 4:5.1.95+git20150122
++ _ZN4KWin9GLTexture10setSwizzleEjjjj@Base 4:5.1.95+git20150122
++ _ZN4KWin9GLTexture11setWrapModeEj@Base 4:5.1.95+git20150122
++ _ZN4KWin9GLTexture12setYInvertedEb@Base 4:5.1.95+git20150122
++ _ZN4KWin9GLTexture15generateMipmapsEv@Base 4:5.1.95+git20150122
++ _ZN4KWin9GLTexture15supportsSwizzleEv@Base 4:5.1.95+git20150122
++ _ZN4KWin9GLTexture16supportsFormatRGEv@Base 4:5.2.1
++ _ZN4KWin9GLTexture26framebufferObjectSupportedEv@Base 4:5.1.95+git20150122
++ _ZN4KWin9GLTexture4bindEv@Base 4:5.1.95+git20150122
++ _ZN4KWin9GLTexture5clearEv@Base 4:5.1.95+git20150122
++ _ZN4KWin9GLTexture6renderE7QRegionRK5QRectb@Base 4:5.1.95+git20150122
++ _ZN4KWin9GLTexture6unbindEv@Base 4:5.1.95+git20150122
++ _ZN4KWin9GLTexture6updateERK6QImageRK6QPointRK5QRect@Base 4:5.1.95+git20150122
++ _ZN4KWin9GLTexture7discardEv@Base 4:5.1.95+git20150122
++ _ZN4KWin9GLTexture8setDirtyEv@Base 4:5.1.95+git20150122
++ _ZN4KWin9GLTexture9setFilterEj@Base 4:5.1.95+git20150122
++ _ZN4KWin9GLTextureC1ERK6QImagej@Base 4:5.1.95+git20150122
++ _ZN4KWin9GLTextureC1ERK7QPixmapj@Base 4:5.1.95+git20150122
++ _ZN4KWin9GLTextureC1ERK7QString@Base 4:5.1.95+git20150122
++ _ZN4KWin9GLTextureC1ERKS0_@Base 4:5.1.95+git20150122
++ _ZN4KWin9GLTextureC1ERNS_16GLTexturePrivateE@Base 4:5.1.95+git20150122
++ _ZN4KWin9GLTextureC1EjRK5QSizei@Base 4:5.1.95+git20150122
++ _ZN4KWin9GLTextureC1Ejiii@Base 4:5.1.95+git20150122
++ _ZN4KWin9GLTextureC1Ev@Base 4:5.1.95+git20150122
++ _ZN4KWin9GLTextureC2ERK6QImagej@Base 4:5.1.95+git20150122
++ _ZN4KWin9GLTextureC2ERK7QPixmapj@Base 4:5.1.95+git20150122
++ _ZN4KWin9GLTextureC2ERK7QString@Base 4:5.1.95+git20150122
++ _ZN4KWin9GLTextureC2ERKS0_@Base 4:5.1.95+git20150122
++ _ZN4KWin9GLTextureC2ERNS_16GLTexturePrivateE@Base 4:5.1.95+git20150122
++ _ZN4KWin9GLTextureC2EjRK5QSizei@Base 4:5.1.95+git20150122
++ _ZN4KWin9GLTextureC2Ejiii@Base 4:5.1.95+git20150122
++ _ZN4KWin9GLTextureC2Ev@Base 4:5.1.95+git20150122
++ _ZN4KWin9GLTextureD0Ev@Base 4:5.1.95+git20150122
++ _ZN4KWin9GLTextureD1Ev@Base 4:5.1.95+git20150122
++ _ZN4KWin9GLTextureD2Ev@Base 4:5.1.95+git20150122
++ _ZN4KWin9GLTextureaSERKS0_@Base 4:5.1.95+git20150122
++ _ZN4KWin9cleanupGLEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin10GLPlatform11glslVersionEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin10GLPlatform11mesaVersionEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin10GLPlatform12isMesaDriverEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin10GLPlatform12isVirtualBoxEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin10GLPlatform12printResultsEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin10GLPlatform13driverVersionEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin10GLPlatform13kernelVersionEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin10GLPlatform13serverVersionEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin10GLPlatform14galliumVersionEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin10GLPlatform14glVendorStringEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin10GLPlatform14isLooseBindingEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin10GLPlatform15glVersionStringEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin10GLPlatform15isGalliumDriverEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin10GLPlatform16glRendererStringEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin10GLPlatform16isVirtualMachineEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin10GLPlatform17platformInterfaceEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin10GLPlatform19isSoftwareEmulationEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin10GLPlatform19preferBufferSubDataEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin10GLPlatform21recommendedCompositorEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin10GLPlatform30glShadingLanguageVersionStringEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin10GLPlatform6driverEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin10GLPlatform6isGLESEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin10GLPlatform7isIntelEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin10GLPlatform8isAdrenoEv@Base 4:5.7.2+git20160823
++ _ZNK4KWin10GLPlatform8isNvidiaEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin10GLPlatform8isRadeonEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin10GLPlatform8isVMwareEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin10GLPlatform8supportsENS_9GLFeatureE@Base 4:5.1.95+git20150122
++ _ZNK4KWin10GLPlatform9chipClassEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin10GLPlatform9glVersionEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin13ShaderManager13isShaderBoundEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin13ShaderManager13isShaderDebugEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin13ShaderManager14getBoundShaderEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin13ShaderManager20generateVertexSourceE6QFlagsINS_11ShaderTraitEE@Base 4:5.1.95+git20150122
++ _ZNK4KWin13ShaderManager22bindAttributeLocationsEPNS_8GLShaderE@Base 4:5.1.95+git20150122
++ _ZNK4KWin13ShaderManager22generateFragmentSourceE6QFlagsINS_11ShaderTraitEE@Base 4:5.1.95+git20150122
++ _ZNK4KWin14GLVertexBuffer10isUseColorEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin8GLShader13prepareSourceEjRK10QByteArray@Base 4:5.1.95+git20150122
++ _ZNK4KWin8GLShader7compileEjjRK10QByteArray@Base 4:5.1.95+git20150122
++ _ZNK4KWin9GLTexture11isYInvertedEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin9GLTexture14internalFormatEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin9GLTexture4sizeEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin9GLTexture5widthEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin9GLTexture6filterEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin9GLTexture6heightEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin9GLTexture6isNullEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin9GLTexture6matrixENS_21TextureCoordinateTypeE@Base 4:5.1.95+git20150122
++ _ZNK4KWin9GLTexture6targetEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin9GLTexture7isDirtyEv@Base 4:5.1.95+git20150122
++ _ZNK4KWin9GLTexture7textureEv@Base 4:5.1.95+git20150122
++ _ZTI11QSharedData@Base 4:5.1.95+git20150122
++ _ZTIN4KWin16GLTexturePrivateE@Base 4:5.1.95+git20150122
++ _ZTIN4KWin9GLTextureE@Base 4:5.1.95+git20150122
++ _ZTS11QSharedData@Base 4:5.1.95+git20150122
++ _ZTSN4KWin16GLTexturePrivateE@Base 4:5.1.95+git20150122
++ _ZTSN4KWin9GLTextureE@Base 4:5.1.95+git20150122
++ _ZTVN4KWin16GLTexturePrivateE@Base 4:5.1.95+git20150122
++ _ZTVN4KWin9GLTextureE@Base 4:5.1.95+git20150122
++ _ZZN4KWin10connectionEvE5s_con@Base 4:5.7.2+git20160823
+diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/debian/libkwinxrenderutils12.install kwin/debian/libkwinxrenderutils12.install
+--- kwin-5.15.5/debian/libkwinxrenderutils12.install	1969-12-31 19:00:00.000000000 -0500
++++ kwin/debian/libkwinxrenderutils12.install	2019-06-12 14:39:30.172877515 -0500
+@@ -0,0 +1,2 @@
++usr/lib/*/libkwinxrenderutils.so.12
++usr/lib/*/libkwinxrenderutils.so.5.*
+diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/debian/libkwinxrenderutils12.symbols kwin/debian/libkwinxrenderutils12.symbols
+--- kwin-5.15.5/debian/libkwinxrenderutils12.symbols	1969-12-31 19:00:00.000000000 -0500
++++ kwin/debian/libkwinxrenderutils12.symbols	2019-06-12 14:39:30.172877515 -0500
+@@ -0,0 +1,32 @@
++# SymbolsHelper-Confirmed: 4:5.7.1 amd64 i386
++libkwinxrenderutils.so.12 libkwinxrenderutils12 #MINVER#
++ _ZN4KWin11preMultiplyERK6QColorf@Base 4:5.1.95+git20150122
++ _ZN4KWin11xRenderFillERK18xcb_render_color_t@Base 4:5.1.95+git20150122
++ _ZN4KWin11xRenderFillERK6QColor@Base 4:5.1.95+git20150122
++ _ZN4KWin12XFixesRegionC1ERK7QRegion@Base 4:5.1.95+git20150122
++ _ZN4KWin12XFixesRegionC2ERK7QRegion@Base 4:5.1.95+git20150122
++ _ZN4KWin12XFixesRegionD0Ev@Base 4:5.1.95+git20150122
++ _ZN4KWin12XFixesRegionD1Ev@Base 4:5.1.95+git20150122
++ _ZN4KWin12XFixesRegionD2Ev@Base 4:5.1.95+git20150122
++ _ZN4KWin12XRenderUtils14findPictFormatEj@Base 4:5.1.95+git20150122
++ _ZN4KWin12XRenderUtils18findPictFormatInfoEj@Base 4:5.1.95+git20150122
++ _ZN4KWin12XRenderUtils4initEP16xcb_connection_tj@Base 4:5.1.95+git20150122
++ _ZN4KWin12XRenderUtils7cleanupEv@Base 4:5.7.1
++ _ZN4KWin14XRenderPicture9fromImageERK6QImage@Base 4:5.1.95+git20150122
++ _ZN4KWin14XRenderPictureC1ERK6QImage@Base 4:5.1.95+git20150122
++ _ZN4KWin14XRenderPictureC1Eji@Base 4:5.1.95+git20150122
++ _ZN4KWin14XRenderPictureC2ERK6QImage@Base 4:5.1.95+git20150122
++ _ZN4KWin14XRenderPictureC2Eji@Base 4:5.1.95+git20150122
++ _ZN4KWin16xRenderOffscreenEv@Base 4:5.1.95+git20150122
++ _ZN4KWin16xRenderPopTargetEv@Base 4:5.1.95+git20150122
++ _ZN4KWin17xRenderPushTargetEPNS_14XRenderPictureE@Base 4:5.1.95+git20150122
++ _ZN4KWin18XRenderPictureDataD1Ev@Base 4:5.1.95+git20150122
++ _ZN4KWin18XRenderPictureDataD2Ev@Base 4:5.1.95+git20150122
++ _ZN4KWin19setXRenderOffscreenEb@Base 4:5.1.95+git20150122
++ _ZN4KWin19xRenderBlendPictureEd@Base 4:5.1.95+git20150122
++ _ZN4KWin22xRenderOffscreenTargetEv@Base 4:5.1.95+git20150122
++ _ZN4KWin28scene_xRenderOffscreenTargetEv@Base 4:5.1.95+git20150122
++ _ZN4KWin31scene_setXRenderOffscreenTargetEj@Base 4:5.1.95+git20150122
++ _ZTIN4KWin12XFixesRegionE@Base 4:5.1.95+git20150122
++ _ZTSN4KWin12XFixesRegionE@Base 4:5.1.95+git20150122
++ _ZTVN4KWin12XFixesRegionE@Base 4:5.1.95+git20150122
+diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/debian/meta/cmake-ignore kwin/debian/meta/cmake-ignore
+--- kwin-5.15.5/debian/meta/cmake-ignore	1969-12-31 19:00:00.000000000 -0500
++++ kwin/debian/meta/cmake-ignore	2019-06-12 14:39:30.172877515 -0500
+@@ -0,0 +1,4 @@
++Qt5Multimedia
++libhybris
++Xwayland
++KF5Kirigami2
+diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/debian/rules kwin/debian/rules
+--- kwin-5.15.5/debian/rules	1969-12-31 19:00:00.000000000 -0500
++++ kwin/debian/rules	2019-06-12 14:39:30.172877515 -0500
+@@ -0,0 +1,20 @@
++#!/usr/bin/make -f
++# -*- makefile -*-
++
++export DEB_LDFLAGS_MAINT_APPEND := -Wl,--as-needed
++
++l10npkgs_firstversion_ok := 4:4.14.0-2
++include /usr/share/pkg-kde-tools/qt-kde-team/2/l10n-packages.mk
++
++%:
++	dh $@ --with kf5,pkgkde_symbolshelper --buildsystem kf5 --without build_stamp
++
++override_dh_strip:
++	dh_strip --dbgsym-migration='kwin-dbg (<= 4:5.5.5-1~~)'
++
++override_dh_auto_test:
++	# Disable auto tests at build time
++	:
++
++override_dh_gencontrol: l10npkgs_firstversion_ok
++	dh_gencontrol
+diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/debian/source/format kwin/debian/source/format
+--- kwin-5.15.5/debian/source/format	1969-12-31 19:00:00.000000000 -0500
++++ kwin/debian/source/format	2019-06-12 14:39:30.172877515 -0500
+@@ -0,0 +1 @@
++3.0 (quilt)
+diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/debian/tests/acc kwin/debian/tests/acc
+--- kwin-5.15.5/debian/tests/acc	1969-12-31 19:00:00.000000000 -0500
++++ kwin/debian/tests/acc	2019-06-12 14:39:30.172877515 -0500
+@@ -0,0 +1,11 @@
++#!/bin/sh
++
++DEB_HOST_MULTIARCH=$(dpkg-architecture -qDEB_HOST_MULTIARCH)
++
++for in_file in debian/*.acc.in; do
++    out_file=${in_file%.in}
++    sed 's/@@DEB_HOST_MULTIARCH@@/'"${DEB_HOST_MULTIARCH}"'/' \
++        "${in_file}" > "${out_file}"
++done
++
++dh_acc
+diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/debian/tests/control kwin/debian/tests/control
+--- kwin-5.15.5/debian/tests/control	1969-12-31 19:00:00.000000000 -0500
++++ kwin/debian/tests/control	2019-06-12 14:39:30.172877515 -0500
+@@ -0,0 +1,10 @@
++#Tests: testsuite
++#Depends: @, debhelper, cmake,
++#         xvfb, xauth, dbus (>= 1.8), xserver-xephyr, libkf5service-bin, kded5,
++#         xwayland, oxygen-icon-theme, mesa-utils,
++#         breeze, dmz-cursor-theme
++#Restrictions: build-needed, allow-stderr
++
++Tests: acc
++Depends: @, dh-acc, exuberant-ctags
++Restrictions: allow-stderr
+diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/debian/tests/testsuite kwin/debian/tests/testsuite
+--- kwin-5.15.5/debian/tests/testsuite	1969-12-31 19:00:00.000000000 -0500
++++ kwin/debian/tests/testsuite	2019-06-12 14:39:30.172877515 -0500
+@@ -0,0 +1,11 @@
++#!/bin/sh
++#if [ -z "$HOME" ] || [ ! -d "$HOME" ]; then
++    [ -e debian/tests.home ] || mkdir debian/tests.home
++    export HOME="$(pwd)/debian/tests.home"
++    trap "rm -rf debian/tests.home" EXIT
++#fi
++mkdir -p "$HOME"/.config || true
++mkdir -p "$HOME"/.kde-unit-test || true
++
++xvfb-run -a --server-args="-screen 0 1024x768x24" \
++    dbus-run-session -- debian/tests/testsuite.xsession
+diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/debian/tests/testsuite.xsession kwin/debian/tests/testsuite.xsession
+--- kwin-5.15.5/debian/tests/testsuite.xsession	1969-12-31 19:00:00.000000000 -0500
++++ kwin/debian/tests/testsuite.xsession	2019-06-12 14:39:30.172877515 -0500
+@@ -0,0 +1,18 @@
++#!/bin/sh
++
++#The XDG runtime dir path must not exceed 108 bytes; otherwise,
++#apparently kwin wouldn't work
++
++TEMPDIR=`mktemp -d`
++trap cleanup EXIT
++export XDG_RUNTIME_DIR=${TEMPDIR}
++
++kwin_wayland --framebuffer & WMPID=$!
++sleep 5
++
++dh_auto_test
++
++cleanup () {
++    if [ -n "$WMPID" ]; then kill "$WMPID"; fi
++    rm -rf ${TEMPDIR}
++}
+diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/debian/upstream/metadata kwin/debian/upstream/metadata
+--- kwin-5.15.5/debian/upstream/metadata	1969-12-31 19:00:00.000000000 -0500
++++ kwin/debian/upstream/metadata	2019-06-12 14:39:30.172877515 -0500
+@@ -0,0 +1,4 @@
++Name: kwin
++Changelog: http://tildearrow.zapto.org/?p=announce
++Repository: https://github.com/tildearrow/kwin-lowlatency.git
++Repository-Browse: https://github.com/tildearrow/kwin-lowlatency
+diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/debian/watch kwin/debian/watch
+--- kwin-5.15.5/debian/watch	1969-12-31 19:00:00.000000000 -0500
++++ kwin/debian/watch	2019-06-12 14:39:30.172877515 -0500
+@@ -0,0 +1,2 @@
++version=4
++opts=pgpsigurlmangle=s/$/.sig/ https://download.kde.org/stable/plasma/([\d.]+)/@PACKAGE@@ANY_VERSION@@ARCHIVE_EXT@
+diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/deleted.h kwin/deleted.h
+--- kwin-5.15.5/deleted.h	2019-05-07 04:55:42.000000000 -0500
++++ kwin/deleted.h	2019-05-19 13:42:10.922867901 -0500
+@@ -185,6 +185,7 @@
+ 
+ protected:
+     virtual void debug(QDebug& stream) const;
++    virtual bool shouldUnredirect() const;
+ private Q_SLOTS:
+     void mainClientClosed(KWin::Toplevel *client);
+     void transientForClosed(Toplevel *toplevel, Deleted *deleted);
+diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/effects/CMakeLists.txt kwin/effects/CMakeLists.txt
+--- kwin-5.15.5/effects/CMakeLists.txt	2019-05-07 04:55:42.000000000 -0500
++++ kwin/effects/CMakeLists.txt	2019-04-21 14:39:10.837350853 -0500
+@@ -87,6 +87,7 @@
+     magnifier/magnifier.cpp
+     mouseclick/mouseclick.cpp
+     mousemark/mousemark.cpp
++    mousepos/mousepos.cpp
+     presentwindows/presentwindows.cpp
+     presentwindows/presentwindows_proxy.cpp
+     resize/resize.cpp
+@@ -118,6 +119,7 @@
+     magnifier/magnifierconfig.kcfgc
+     mouseclick/mouseclickconfig.kcfgc
+     mousemark/mousemarkconfig.kcfgc
++    mousepos/mouseposconfig.kcfgc
+     presentwindows/presentwindowsconfig.kcfgc
+     resize/resizeconfig.kcfgc
+     showfps/showfpsconfig.kcfgc
+@@ -182,6 +184,7 @@
+ add_subdirectory( magnifier )
+ add_subdirectory( mouseclick )
+ add_subdirectory( mousemark )
++add_subdirectory( mousepos )
+ include( screenshot/CMakeLists.txt )
+ include( sheet/CMakeLists.txt )
+ include( snaphelper/CMakeLists.txt )
+diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/effects/effect_builtins.cpp kwin/effects/effect_builtins.cpp
+--- kwin-5.15.5/effects/effect_builtins.cpp	2019-05-07 04:55:42.000000000 -0500
++++ kwin/effects/effect_builtins.cpp	2019-05-19 13:42:10.956201234 -0500
+@@ -54,6 +54,7 @@
+ #include "magnifier/magnifier.h"
+ #include "mouseclick/mouseclick.h"
+ #include "mousemark/mousemark.h"
++#include "mousepos/mousepos.h"
+ #include "sheet/sheet.h"
+ #include "snaphelper/snaphelper.h"
+ #include "startupfeedback/startupfeedback.h"
+@@ -381,6 +382,21 @@
+         nullptr,
+         nullptr
+ #endif
++EFFECT_FALLBACK
++    }, {
++        QStringLiteral("mousepos"),
++        i18ndc("kwin_effects", "Name of a KWin Effect", "Paint cursor"),
++        i18ndc("kwin_effects", "Comment describing the KWin Effect", "Redraw the mouse cursor for capturing the display using kmsgrab in FFmpeg"),
++        QStringLiteral("Tools"),
++        QString(),
++        QUrl(),
++        false,
++        false,
++#ifdef EFFECT_BUILTINS
++        &createHelper<MousePosEffect>,
++        nullptr,
++        nullptr
++#endif
+ EFFECT_FALLBACK
+     }, {
+         QStringLiteral("presentwindows"),
+diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/effects/presentwindows/presentwindows_config.ui kwin/effects/presentwindows/presentwindows_config.ui
+--- kwin-5.15.5/effects/presentwindows/presentwindows_config.ui	2019-05-07 04:55:42.000000000 -0500
++++ kwin/effects/presentwindows/presentwindows_config.ui	2019-04-21 16:07:02.044177566 -0500
+@@ -164,6 +164,11 @@
+           <string>(Un-)Minimize window</string>
+          </property>
+         </item>
++        <item>
++         <property name="text">
++          <string>Close window</string>
++         </property>
++        </item>
+        </widget>
+       </item>
+       <item row="1" column="0">
+@@ -208,6 +213,11 @@
+           <string>(Un-)Minimize window</string>
+          </property>
+         </item>
++        <item>
++         <property name="text">
++          <string>Close window</string>
++         </property>
++        </item>
+        </widget>
+       </item>
+       <item row="2" column="0">
+@@ -252,6 +262,11 @@
+           <string>(Un-)Minimize window</string>
+          </property>
+         </item>
++        <item>
++         <property name="text">
++          <string>Close window</string>
++         </property>
++        </item>
+        </widget>
+       </item>
+      </layout>
+diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/effects/presentwindows/presentwindows.cpp kwin/effects/presentwindows/presentwindows.cpp
+--- kwin-5.15.5/effects/presentwindows/presentwindows.cpp	2019-05-07 04:55:42.000000000 -0500
++++ kwin/effects/presentwindows/presentwindows.cpp	2019-05-19 13:42:11.042867896 -0500
+@@ -719,6 +719,11 @@
+                 m_highlightedWindow->minimize();
+         }
+         break;
++    case WindowCloseAction:
++        if (m_highlightedWindow) {
++            m_highlightedWindow->closeWindow();
++        }
++        break;
+     default:
+         break;
+     }
+diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/effects/presentwindows/presentwindows.h kwin/effects/presentwindows/presentwindows.h
+--- kwin-5.15.5/effects/presentwindows/presentwindows.h	2019-05-07 04:55:42.000000000 -0500
++++ kwin/effects/presentwindows/presentwindows.h	2019-04-21 16:07:02.044177566 -0500
+@@ -149,7 +149,8 @@
+         WindowExitAction = 2, // Deactivates the effect without activating new window
+         WindowToCurrentDesktopAction = 3, // Brings window to current desktop
+         WindowToAllDesktopsAction = 4, // Brings window to all desktops
+-        WindowMinimizeAction = 5 // Minimize the window
++        WindowMinimizeAction = 5, // Minimize the window
++        WindowCloseAction = 6 // Closes the window
+     };
+     enum DesktopMouseAction {
+         DesktopNoAction = 0, // nothing
+diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/effects/shaders.qrc kwin/effects/shaders.qrc
+--- kwin-5.15.5/effects/shaders.qrc	2019-05-07 04:55:42.000000000 -0500
++++ kwin/effects/shaders.qrc	2019-04-21 14:39:11.104017527 -0500
+@@ -6,6 +6,8 @@
+   <file alias="cylinder.vert">cube/data/1.10/cylinder.vert</file>
+   <file alias="sphere.vert">cube/data/1.10/sphere.vert</file>
+   <file alias="invert.frag">invert/data/1.10/invert.frag</file>
++  <file alias="motion.vert">mousepos/data/1.10/motion.vert</file>
++  <file alias="motion.frag">mousepos/data/1.10/motion.frag</file>
+   <file alias="lookingglass.frag">lookingglass/data/1.10/lookingglass.frag</file>
+   <file alias="blinking-startup-fragment.glsl">startupfeedback/data/1.10/blinking-startup-fragment.glsl</file>
+ </qresource>
+@@ -16,6 +18,8 @@
+   <file alias="cylinder.vert">cube/data/1.40/cylinder.vert</file>
+   <file alias="sphere.vert">cube/data/1.40/sphere.vert</file>
+   <file alias="invert.frag">invert/data/1.40/invert.frag</file>
++  <file alias="motion.vert">mousepos/data/1.40/motion.vert</file>
++  <file alias="motion.frag">mousepos/data/1.40/motion.frag</file>
+   <file alias="lookingglass.frag">lookingglass/data/1.40/lookingglass.frag</file>
+   <file alias="blinking-startup-fragment.glsl">startupfeedback/data/1.40/blinking-startup-fragment.glsl</file>
+ </qresource>
+diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/effects/zoom/zoom.cpp kwin/effects/zoom/zoom.cpp
+--- kwin-5.15.5/effects/zoom/zoom.cpp	2019-05-07 04:55:42.000000000 -0500
++++ kwin/effects/zoom/zoom.cpp	2019-05-19 13:42:11.069534562 -0500
+@@ -45,6 +45,7 @@
+ ZoomEffect::ZoomEffect()
+     : Effect()
+     , zoom(1)
++    , previous_zoom(1)
+     , target_zoom(1)
+     , polling(false)
+     , zoomFactor(1.25)
+@@ -254,6 +255,7 @@
+ 
+ void ZoomEffect::prePaintScreen(ScreenPrePaintData& data, int time)
+ {
++    previous_zoom=zoom;
+     if (zoom != target_zoom) {
+         const float zoomDist = qAbs(target_zoom - source_zoom);
+         if (target_zoom > zoom)
+diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/effects/zoom/zoom.h kwin/effects/zoom/zoom.h
+--- kwin-5.15.5/effects/zoom/zoom.h	2019-05-07 04:55:42.000000000 -0500
++++ kwin/effects/zoom/zoom.h	2019-04-21 14:39:11.107350862 -0500
+@@ -100,6 +100,7 @@
+     void moveZoom(int x, int y);
+ private:
+     double zoom;
++    double previous_zoom;
+     double target_zoom;
+     double source_zoom;
+     bool polling; // Mouse polling
+diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/effects.cpp kwin/effects.cpp
+--- kwin-5.15.5/effects.cpp	2019-05-07 04:55:42.000000000 -0500
++++ kwin/effects.cpp	2019-05-19 13:42:10.939534568 -0500
+@@ -642,6 +642,7 @@
+     }
+     const bool activeChanged = (e == nullptr || fullscreen_effect == nullptr);
+     fullscreen_effect = e;
++    m_compositor->checkUnredirect();
+     emit activeFullScreenEffectChanged();
+     if (activeChanged) {
+         emit hasActiveFullScreenEffectChanged();
+diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/geometry.cpp kwin/geometry.cpp
+--- kwin-5.15.5/geometry.cpp	2019-05-07 04:55:42.000000000 -0500
++++ kwin/geometry.cpp	2019-05-19 13:42:11.072867896 -0500
+@@ -86,6 +86,9 @@
+     if (effects) {
+         static_cast<EffectsHandlerImpl*>(effects)->desktopResized(geom.size());
+     }
++
++    //Update the shape of the overlay window to fix redrawing of unredirected windows. bug#305781
++    m_compositor->checkUnredirect(true);
+ }
+ 
+ void Workspace::saveOldScreenSizes()
+@@ -2137,6 +2140,10 @@
+     updateWindowRules(Rules::Position);
+     screens()->setCurrent(this);
+     workspace()->updateStackingOrder();
++    if (Compositor::isCreated()) {
++        // TODO: move out of geometry.cpp, is this really needed here?
++        Compositor::self()->checkUnredirect();
++    }
+     // client itself is not damaged
+     addRepaintDuringGeometryUpdates();
+     updateGeometryBeforeUpdateBlocking();
+@@ -3245,9 +3252,11 @@
+         syncRequest.timeout->start(250);
+         sendSyncRequest();
+     } else {                            // for clients not supporting the XSYNC protocol, we
+-        syncRequest.isPending = true;   // limit the resizes to 30Hz to take pointless load from X11
+-        syncRequest.timeout->start(33); // and the client, the mouse is still moved at full speed
++        //syncRequest.isPending = true; // limit the resizes to 30Hz to take pointless load from X11
++        performMoveResize();
++        //syncRequest.timeout->start(1);// and the client, the mouse is still moved at full speed
+     }                                   // and no human can control faster resizes anyway
++                                        // no, don't. Windows can do 60Hz resizes, so why don't we?
+     const QRect &moveResizeGeom = moveResizeGeometry();
+     m_client.setGeometry(0, 0, moveResizeGeom.width() - (borderLeft() + borderRight()), moveResizeGeom.height() - (borderTop() + borderBottom()));
+ }
+diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/HACKING.md kwin/HACKING.md
+--- kwin-5.15.5/HACKING.md	2019-05-07 04:55:42.000000000 -0500
++++ kwin/HACKING.md	2019-05-18 16:10:42.698150220 -0500
+@@ -21,13 +21,16 @@
+ 
+ To start a nested KWin Wayland use:
+ 
+-    cd build
+-    cd bin
+-    QT_PLUGIN_PATH=`pwd` dbus-run-session ./kwin_wayland --xwayland --socket=wayland-1
++```
++cd build
++QT_PLUGIN_PATH="$PWD/bin" dbus-run-session ./bin/kwin_wayland --xwayland --socket=wayland-1
++```
+ 
+ The socket option is not required if KWin is started from an X11 session. On Wayland of course a socket not matching the session's socket must be chosen. To show windows in the nested KWin adjust the environment variables DISPLAY (for X11 windows) and WAYLAND_DISPLAY (for Wayland windows). Alternatively it's possible to pass applications to launch as command line arguments to kwin_wayland command. E.g.
+ 
+-    QT_PLUGIN_PATH=`pwd` dbus-run-session ./kwin_wayland --xwayland --socket=wayland-1 konsole
++```
++QT_PLUGIN_PATH="$PWD/bin" dbus-run-session ./bin/kwin_wayland --xwayland --socket=wayland-1
++```
+ 
+ Will start a konsole in the nested KWin.
+ 
+@@ -47,9 +50,10 @@
+ 
+ KWin for the X11 windowing system cannot be tested with a nested Wayland setup. Instead the common way is to run KWin and replace the existing window manager of the X session:
+ 
+-    cd build
+-    cd bin
+-    QT_PLUGIN_PATH=`pwd` ./kwin_x11 --replace
++```
++cd build
++QT_PLUGIN_PATH="$PWD/bin" ./bin/kwin_x11 --replace
++```
+ 
+ In this case also the current DBus session should be used and dbus-run-session should not be used. Of course it's only possible to start kwin_x11 in an X session. On Wayland kwin_x11 will refuse to start.
+ 
+diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/kcmkwin/kwincompositing/compositing.cpp kwin/kcmkwin/kwincompositing/compositing.cpp
+--- kwin-5.15.5/kcmkwin/kwincompositing/compositing.cpp	2019-05-07 04:55:42.000000000 -0500
++++ kwin/kcmkwin/kwincompositing/compositing.cpp	2019-05-07 15:22:18.606174262 -0500
+@@ -41,6 +41,7 @@
+     , m_windowThumbnail(0)
+     , m_glScaleFilter(0)
+     , m_xrScaleFilter(false)
++    , m_unredirectFullscreen(false)
+     , m_glSwapStrategy(0)
+     , m_compositingType(0)
+     , m_compositingEnabled(true)
+@@ -48,6 +49,10 @@
+     , m_openGLPlatformInterfaceModel(new OpenGLPlatformInterfaceModel(this))
+     , m_openGLPlatformInterface(0)
+     , m_windowsBlockCompositing(true)
++    , m_animationCurve(2)
++    , m_latencyControl(1)
++    , m_maxLatency(8)
++    , m_minLatency(0)
+     , m_compositingInterface(new OrgKdeKwinCompositingInterface(QStringLiteral("org.kde.KWin"), QStringLiteral("/Compositor"), QDBusConnection::sessionBus(), this))
+ {
+     reset();
+@@ -55,11 +60,16 @@
+     connect(this, &Compositing::windowThumbnailChanged,      this, &Compositing::changed);
+     connect(this, &Compositing::glScaleFilterChanged,        this, &Compositing::changed);
+     connect(this, &Compositing::xrScaleFilterChanged,        this, &Compositing::changed);
++    connect(this, &Compositing::unredirectFullscreenChanged, this, &Compositing::changed);
+     connect(this, &Compositing::glSwapStrategyChanged,       this, &Compositing::changed);
+     connect(this, &Compositing::compositingTypeChanged,      this, &Compositing::changed);
+     connect(this, &Compositing::compositingEnabledChanged,   this, &Compositing::changed);
+     connect(this, &Compositing::openGLPlatformInterfaceChanged, this, &Compositing::changed);
+     connect(this, &Compositing::windowsBlockCompositingChanged, this, &Compositing::changed);
++    connect(this, &Compositing::animationCurveChanged,          this, &Compositing::changed);
++    connect(this, &Compositing::latencyControlChanged,          this, &Compositing::changed);
++    connect(this, &Compositing::maxLatencyChanged,              this, &Compositing::changed);
++    connect(this, &Compositing::minLatencyChanged,              this, &Compositing::changed);
+ 
+     connect(this, &Compositing::changed, [this]{
+         m_changed = true;
+@@ -73,6 +83,7 @@
+     setWindowThumbnail(kwinConfig.readEntry("HiddenPreviews", 5) - 4);
+     setGlScaleFilter(kwinConfig.readEntry("GLTextureFilter", 2));
+     setXrScaleFilter(kwinConfig.readEntry("XRenderSmoothScale", false));
++    setUnredirectFullscreen(kwinConfig.readEntry("UnredirectFullscreen", false));
+     setCompositingEnabled(kwinConfig.readEntry("Enabled", true));
+ 
+     auto swapStrategy = [&kwinConfig]() {
+@@ -114,6 +125,11 @@
+ 
+     setWindowsBlockCompositing(kwinConfig.readEntry("WindowsBlockCompositing", true));
+ 
++    setAnimationCurve(kwinConfig.readEntry("AnimationCurve",2));
++    setLatencyControl(kwinConfig.readEntry("LatencyControl",1));
++    setMaxLatency(kwinConfig.readEntry("MaxLatency",8));
++    setMinLatency(kwinConfig.readEntry("MinLatency",0));
++
+     m_changed = false;
+ }
+ 
+@@ -123,11 +139,16 @@
+     setWindowThumbnail(1);
+     setGlScaleFilter(2);
+     setXrScaleFilter(false);
++    setUnredirectFullscreen(false);
+     setGlSwapStrategy(1);
+     setCompositingType(CompositingType::OPENGL20_INDEX);
+     const QModelIndex index = m_openGLPlatformInterfaceModel->indexForKey(QStringLiteral("glx"));
+     setOpenGLPlatformInterface(index.isValid() ? index.row() : 0);
+     setWindowsBlockCompositing(true);
++    setAnimationCurve(2);
++    setLatencyControl(1);
++    setMaxLatency(8);
++    setMinLatency(0);
+     m_changed = true;
+ }
+ 
+@@ -183,6 +204,11 @@
+     return m_xrScaleFilter;
+ }
+ 
++bool Compositing::unredirectFullscreen() const
++{
++    return m_unredirectFullscreen;
++}
++
+ int Compositing::glSwapStrategy() const
+ {
+     return m_glSwapStrategy;
+@@ -225,6 +251,15 @@
+     emit glSwapStrategyChanged(strategy);
+ }
+ 
++void Compositing::setUnredirectFullscreen(bool unredirect)
++{
++    if (unredirect == m_unredirectFullscreen) {
++        return;
++    }
++    m_unredirectFullscreen = unredirect;
++    emit unredirectFullscreenChanged(unredirect);
++}
++
+ void Compositing::setWindowThumbnail(int index)
+ {
+     if (index == m_windowThumbnail) {
+@@ -272,6 +307,7 @@
+     kwinConfig.writeEntry("HiddenPreviews", windowThumbnail() + 4);
+     kwinConfig.writeEntry("GLTextureFilter", glScaleFilter());
+     kwinConfig.writeEntry("XRenderSmoothScale", xrScaleFilter());
++    kwinConfig.writeEntry("UnredirectFullscreen", unredirectFullscreen());
+     if (!compositingRequired()) {
+         kwinConfig.writeEntry("Enabled", compositingEnabled());
+     }
+@@ -312,6 +348,10 @@
+     if (!compositingRequired()) {
+         kwinConfig.writeEntry("WindowsBlockCompositing", windowsBlockCompositing());
+     }
++    kwinConfig.writeEntry("AnimationCurve",animationCurve());
++    kwinConfig.writeEntry("LatencyControl",latencyControl());
++    kwinConfig.writeEntry("MaxLatency",maxLatency());
++    kwinConfig.writeEntry("MinLatency",minLatency());
+     kwinConfig.sync();
+ 
+     if (m_changed) {
+@@ -360,6 +400,62 @@
+     emit windowsBlockCompositingChanged(set);
+ }
+ 
++int Compositing::animationCurve() const
++{
++    return m_animationCurve;
++}
++
++int Compositing::latencyControl() const
++{
++    return m_latencyControl;
++}
++
++int Compositing::maxLatency() const
++{
++    return m_maxLatency;
++}
++
++int Compositing::minLatency() const
++{
++    return m_minLatency;
++}
++
++void Compositing::setAnimationCurve(int val)
++{
++    if (m_animationCurve == val) {
++        return;
++    }
++    m_animationCurve = val;
++    emit animationCurveChanged(val);
++}
++
++void Compositing::setLatencyControl(int val)
++{
++    if (m_latencyControl == val) {
++        return;
++    }
++    m_latencyControl = val;
++    emit latencyControlChanged(val);
++}
++
++void Compositing::setMaxLatency(int val)
++{
++    if (m_maxLatency == val) {
++        return;
++    }
++    m_maxLatency = val;
++    emit maxLatencyChanged(val);
++}
++
++void Compositing::setMinLatency(int val)
++{
++    if (m_minLatency == val) {
++        return;
++    }
++    m_minLatency = val;
++    emit minLatencyChanged(val);
++}
++
+ bool Compositing::compositingRequired() const
+ {
+     return m_compositingInterface->platformRequiresCompositing();
+diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/kcmkwin/kwincompositing/compositing.h kwin/kcmkwin/kwincompositing/compositing.h
+--- kwin-5.15.5/kcmkwin/kwincompositing/compositing.h	2019-05-07 04:55:42.000000000 -0500
++++ kwin/kcmkwin/kwincompositing/compositing.h	2019-05-07 15:22:18.606174262 -0500
+@@ -40,12 +40,17 @@
+     Q_PROPERTY(int windowThumbnail READ windowThumbnail WRITE setWindowThumbnail NOTIFY windowThumbnailChanged)
+     Q_PROPERTY(int glScaleFilter READ glScaleFilter WRITE setGlScaleFilter NOTIFY glScaleFilterChanged)
+     Q_PROPERTY(bool xrScaleFilter READ xrScaleFilter WRITE setXrScaleFilter NOTIFY xrScaleFilterChanged)
++    Q_PROPERTY(bool unredirectFullscreen READ unredirectFullscreen WRITE setUnredirectFullscreen NOTIFY unredirectFullscreenChanged)
+     Q_PROPERTY(int glSwapStrategy READ glSwapStrategy WRITE setGlSwapStrategy NOTIFY glSwapStrategyChanged)
+     Q_PROPERTY(int compositingType READ compositingType WRITE setCompositingType NOTIFY compositingTypeChanged)
+     Q_PROPERTY(bool compositingEnabled READ compositingEnabled WRITE setCompositingEnabled NOTIFY compositingEnabledChanged)
+     Q_PROPERTY(KWin::Compositing::OpenGLPlatformInterfaceModel *openGLPlatformInterfaceModel READ openGLPlatformInterfaceModel CONSTANT)
+     Q_PROPERTY(int openGLPlatformInterface READ openGLPlatformInterface WRITE setOpenGLPlatformInterface NOTIFY openGLPlatformInterfaceChanged)
+     Q_PROPERTY(bool windowsBlockCompositing READ windowsBlockCompositing WRITE setWindowsBlockCompositing NOTIFY windowsBlockCompositingChanged)
++    Q_PROPERTY(int animationCurve READ animationCurve WRITE setAnimationCurve NOTIFY animationCurveChanged)
++    Q_PROPERTY(int latencyControl READ latencyControl WRITE setLatencyControl NOTIFY latencyControlChanged)
++    Q_PROPERTY(int maxLatency READ maxLatency WRITE setMaxLatency NOTIFY maxLatencyChanged)
++    Q_PROPERTY(int minLatency READ minLatency WRITE setMinLatency NOTIFY minLatencyChanged)
+     Q_PROPERTY(bool compositingRequired READ compositingRequired CONSTANT)
+ public:
+     explicit Compositing(QObject *parent = 0);
+@@ -57,11 +62,16 @@
+     int windowThumbnail() const;
+     int glScaleFilter() const;
+     bool xrScaleFilter() const;
++    bool unredirectFullscreen() const;
+     int glSwapStrategy() const;
+     int compositingType() const;
+     bool compositingEnabled() const;
+     int openGLPlatformInterface() const;
+     bool windowsBlockCompositing() const;
++    int animationCurve() const;
++    int latencyControl() const;
++    int maxLatency() const;
++    int minLatency() const;
+     bool compositingRequired() const;
+ 
+     OpenGLPlatformInterfaceModel *openGLPlatformInterfaceModel() const;
+@@ -70,12 +80,16 @@
+     void setWindowThumbnail(int index);
+     void setGlScaleFilter(int index);
+     void setXrScaleFilter(bool filter);
++    void setUnredirectFullscreen(bool unredirect);
+     void setGlSwapStrategy(int strategy);
+     void setCompositingType(int index);
+-    void setCompositingEnabled(bool enalbed);
++    void setCompositingEnabled(bool enabled);
+     void setOpenGLPlatformInterface(int interface);
+     void setWindowsBlockCompositing(bool set);
+-
++    void setAnimationCurve(int curve);
++    void setLatencyControl(int index);
++    void setMaxLatency(int val);
++    void setMinLatency(int val);
+     void save();
+ 
+ public Q_SLOTS:
+@@ -88,17 +102,23 @@
+     void windowThumbnailChanged(int);
+     void glScaleFilterChanged(int);
+     void xrScaleFilterChanged(int);
++    void unredirectFullscreenChanged(bool);
+     void glSwapStrategyChanged(int);
+     void compositingTypeChanged(int);
+     void compositingEnabledChanged(bool);
+     void openGLPlatformInterfaceChanged(int);
+     void windowsBlockCompositingChanged(bool);
++    void animationCurveChanged(int);
++    void latencyControlChanged(int);
++    void maxLatencyChanged(int);
++    void minLatencyChanged(int);
+ 
+ private:
+     int m_animationSpeed;
+     int m_windowThumbnail;
+     int m_glScaleFilter;
+     bool m_xrScaleFilter;
++    bool m_unredirectFullscreen;
+     int m_glSwapStrategy;
+     int m_compositingType;
+     bool m_compositingEnabled;
+@@ -106,6 +126,10 @@
+     OpenGLPlatformInterfaceModel *m_openGLPlatformInterfaceModel;
+     int m_openGLPlatformInterface;
+     bool m_windowsBlockCompositing;
++    int m_animationCurve;
++    int m_latencyControl;
++    int m_maxLatency;
++    int m_minLatency;
+     bool m_windowsBlockingCompositing;
+     OrgKdeKwinCompositingInterface *m_compositingInterface;
+ };
+diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/kcmkwin/kwincompositing/compositing.ui kwin/kcmkwin/kwincompositing/compositing.ui
+--- kwin-5.15.5/kcmkwin/kwincompositing/compositing.ui	2019-05-07 04:55:42.000000000 -0500
++++ kwin/kcmkwin/kwincompositing/compositing.ui	2019-05-07 15:22:18.632840930 -0500
+@@ -6,8 +6,8 @@
+    <rect>
+     <x>0</x>
+     <y>0</y>
+-    <width>462</width>
+-    <height>349</height>
++    <width>497</width>
++    <height>552</height>
+    </rect>
+   </property>
+   <layout class="QFormLayout" name="formLayout">
+@@ -21,16 +21,32 @@
+        <property name="visible">
+         <bool>false</bool>
+        </property>
+-       <property name="text">
++       <property name="text" stdset="0">
+         <string>OpenGL compositing (the default) has crashed KWin in the past.
+ This was most likely due to a driver bug.
+ If you think that you have meanwhile upgraded to a stable driver,
+ you can reset this protection but be aware that this might result in an immediate crash!
+ Alternatively, you might want to use the XRender backend instead.</string>
+        </property>
++       <property name="wordWrap" stdset="0">
++        <bool>true</bool>
++       </property>
++      </widget>
++     </item>
++     <item>
++      <widget class="KMessageWidget" name="unredirectInformation">
++       <property name="visible">
++        <bool>false</bool>
++       </property>
++       <property name="text">
++        <string>Having full screen windows bypass the compositor is not supported on every hardware.</string>
++       </property>
+        <property name="wordWrap">
+         <bool>true</bool>
+        </property>
++       <property name="messageType">
++        <enum>KMessageWidget::Information</enum>
++       </property>
+       </widget>
+      </item>
+      <item>
+@@ -38,10 +54,10 @@
+        <property name="visible">
+         <bool>false</bool>
+        </property>
+-       <property name="text">
++       <property name="text" stdset="0">
+         <string>Scale method &quot;Accurate&quot; is not supported by all hardware and can cause performance regressions and rendering artifacts.</string>
+        </property>
+-       <property name="wordWrap">
++       <property name="wordWrap" stdset="0">
+         <bool>true</bool>
+        </property>
+       </widget>
+@@ -51,7 +67,7 @@
+        <property name="visible">
+         <bool>false</bool>
+        </property>
+-       <property name="wordWrap">
++       <property name="wordWrap" stdset="0">
+         <bool>true</bool>
+        </property>
+       </widget>
+@@ -61,10 +77,10 @@
+        <property name="visible">
+         <bool>false</bool>
+        </property>
+-       <property name="text">
++       <property name="text" stdset="0">
+         <string>Keeping the window thumbnail always interferes with the minimized state of windows. This can result in windows not suspending their work when minimized.</string>
+        </property>
+-       <property name="wordWrap">
++       <property name="wordWrap" stdset="0">
+         <bool>true</bool>
+        </property>
+       </widget>
+@@ -281,6 +297,115 @@
+      </property>
+     </widget>
+    </item>
++   <item row="13" column="1">
++    <widget class="QCheckBox" name="unredirectFullscreen">
++     <property name="text">
++      <string>Suspend compositor for full screen windows</string>
++     </property>
++    </widget>
++   </item>
++   <item row="14" column="0" colspan="2">
++    <widget class="Line" name="line_3">
++     <property name="orientation">
++      <enum>Qt::Horizontal</enum>
++     </property>
++    </widget>
++   </item>
++   <item row="15" column="0">
++    <widget class="QLabel" name="label_7">
++     <property name="text">
++      <string>Animation curve:</string>
++     </property>
++    </widget>
++   </item>
++   <item row="15" column="1">
++    <widget class="QComboBox" name="animationCurve">
++     <item>
++      <property name="text">
++       <string>Linear</string>
++      </property>
++     </item>
++     <item>
++      <property name="text">
++       <string>Quadratic</string>
++      </property>
++     </item>
++     <item>
++      <property name="text">
++       <string>Sine</string>
++      </property>
++     </item>
++    </widget>
++   </item>
++   <item row="16" column="0">
++    <widget class="QLabel" name="label_8">
++     <property name="text">
++      <string>Latency/stutter control:</string>
++     </property>
++    </widget>
++   </item>
++   <item row="16" column="1">
++    <widget class="QComboBox" name="latencyControl">
++     <item>
++      <property name="text">
++       <string>Favor responsiveness</string>
++      </property>
++     </item>
++     <item>
++      <property name="text">
++       <string>Balanced</string>
++      </property>
++     </item>
++     <item>
++      <property name="text">
++       <string>Favor low latency</string>
++      </property>
++     </item>
++     <item>
++      <property name="text">
++       <string>Aggressively favor low latency</string>
++      </property>
++     </item>
++    </widget>
++   </item>
++   <item row="17" column="0">
++    <widget class="QLabel" name="label_9">
++     <property name="text">
++      <string>Maximum latency reduction:</string>
++     </property>
++    </widget>
++   </item>
++   <item row="17" column="1">
++    <widget class="QSpinBox" name="maxLatency">
++     <property name="maximum">
++      <number>8</number>
++     </property>
++    </widget>
++   </item>
++   <item row="18" column="0">
++    <widget class="QLabel" name="label_10">
++     <property name="text">
++      <string>Minimum latency reduction:</string>
++     </property>
++    </widget>
++   </item>
++   <item row="18" column="1">
++    <widget class="QSpinBox" name="minLatency">
++     <property name="maximum">
++      <number>8</number>
++     </property>
++    </widget>
++   </item>
++   <item row="19" column="1">
++    <widget class="QLabel" name="label_11">
++     <property name="text">
++      <string>(units in milliseconds)</string>
++     </property>
++     <property name="alignment">
++      <set>Qt::AlignRight|Qt::AlignTrailing|Qt::AlignVCenter</set>
++     </property>
++    </widget>
++   </item>
+   </layout>
+  </widget>
+  <customwidgets>
+diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/kcmkwin/kwincompositing/main.cpp kwin/kcmkwin/kwincompositing/main.cpp
+--- kwin-5.15.5/kcmkwin/kwincompositing/main.cpp	2019-05-07 04:55:42.000000000 -0500
++++ kwin/kcmkwin/kwincompositing/main.cpp	2019-05-19 13:42:11.126201226 -0500
+@@ -26,6 +26,7 @@
+ #include <QAction>
+ #include <QApplication>
+ #include <QLayout>
++#include <QSpinBox>
+ 
+ #include <kcmodule.h>
+ #include <kservice.h>
+@@ -87,6 +88,7 @@
+     m_form.scaleWarning->setIcon(QIcon::fromTheme(QStringLiteral("dialog-warning")));
+     m_form.tearingWarning->setIcon(QIcon::fromTheme(QStringLiteral("dialog-warning")));
+     m_form.windowThumbnailWarning->setIcon(QIcon::fromTheme(QStringLiteral("dialog-warning")));
++    m_form.unredirectInformation->setIcon(QIcon::fromTheme(QStringLiteral("dialog-information")));
+ 
+     m_form.compositingEnabled->setVisible(!m_compositing->compositingRequired());
+     m_form.windowsBlockCompositing->setVisible(!m_compositing->compositingRequired());
+@@ -98,6 +100,7 @@
+ {
+     using namespace KWin::Compositing;
+     auto currentIndexChangedSignal = static_cast<void(QComboBox::*)(int)>(&QComboBox::currentIndexChanged);
++    auto valueChangedSignal = static_cast<void(QSpinBox::*)(int)>(&QSpinBox::valueChanged);
+ 
+     connect(m_compositing, &Compositing::changed, this, static_cast<void(KCModule::*)()>(&KWinCompositingSettings::changed));
+ 
+@@ -180,6 +183,40 @@
+     connect(m_compositing, &Compositing::windowsBlockCompositingChanged, m_form.windowsBlockCompositing, &QCheckBox::setChecked);
+     connect(m_form.windowsBlockCompositing, &QCheckBox::toggled, m_compositing, &Compositing::setWindowsBlockCompositing);
+ 
++    // unredirect fullscreen
++    m_form.unredirectFullscreen->setChecked(m_compositing->unredirectFullscreen());
++    connect(m_compositing, &Compositing::unredirectFullscreenChanged, m_form.unredirectFullscreen, &QCheckBox::setChecked);
++    connect(m_form.unredirectFullscreen, &QCheckBox::toggled, m_compositing, &Compositing::setUnredirectFullscreen);
++    connect(m_form.unredirectFullscreen, &QCheckBox::toggled,
++        [this](bool enabled) {
++            if (enabled) {
++                m_form.unredirectInformation->animatedShow();
++            } else {
++                m_form.unredirectInformation->animatedHide();
++            }
++        }
++    );
++
++    // animation curve
++    m_form.animationCurve->setCurrentIndex(m_compositing->animationCurve());
++    connect(m_compositing, &Compositing::animationCurveChanged, m_form.animationCurve, &QComboBox::setCurrentIndex);
++    connect(m_form.animationCurve, currentIndexChangedSignal, m_compositing, &Compositing::setAnimationCurve);
++
++    // latency control
++    m_form.latencyControl->setCurrentIndex(m_compositing->latencyControl());
++    connect(m_compositing, &Compositing::latencyControlChanged, m_form.latencyControl, &QComboBox::setCurrentIndex);
++    connect(m_form.latencyControl, currentIndexChangedSignal, m_compositing, &Compositing::setLatencyControl);
++
++    // max latency
++    m_form.maxLatency->setValue(m_compositing->maxLatency());
++    connect(m_compositing, &Compositing::maxLatencyChanged, m_form.maxLatency, &QSpinBox::setValue);
++    connect(m_form.maxLatency, valueChangedSignal, m_compositing, &Compositing::setMaxLatency);
++
++    // min latency
++    m_form.minLatency->setValue(m_compositing->minLatency());
++    connect(m_compositing, &Compositing::minLatencyChanged, m_form.minLatency, &QSpinBox::setValue);
++    connect(m_form.minLatency, valueChangedSignal, m_compositing, &Compositing::setMinLatency);
++
+     // compositing type
+     CompositingType *type = new CompositingType(this);
+     m_form.type->setModel(type);
+diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/kwin.kcfg kwin/kwin.kcfg
+--- kwin-5.15.5/kwin.kcfg	2019-05-07 04:55:42.000000000 -0500
++++ kwin/kwin.kcfg	2019-05-07 15:22:18.646174264 -0500
+@@ -251,6 +251,9 @@
+             <min>4</min>
+             <max>6</max>
+         </entry>
++        <entry name="UnredirectFullscreen" type="Bool">
++            <default>false</default>
++        </entry>
+         <entry name="AnimationSpeed" type="Int">
+             <default>3</default>
+             <min>0</min>
+@@ -262,6 +265,26 @@
+         <entry name="WindowsBlockCompositing" type="Bool">
+             <default>true</default>
+         </entry>
++        <entry name="AnimationCurve" type="Int">
++            <default>2</default>
++            <min>0</min>
++            <max>2</max>
++        </entry>
++        <entry name="LatencyControl" type="Int">
++            <default>1</default>
++            <min>0</min>
++            <max>3</max>
++        </entry>
++        <entry name="MaxLatency" type="Int">
++            <default>8</default>
++            <min>0</min>
++            <max>8</max>
++        </entry>
++        <entry name="MinLatency" type="Int">
++            <default>0</default>
++            <min>0</min>
++            <max>8</max>
++        </entry>
+     </group>
+     <group name="TabBox">
+         <entry name="ShowDelay" type="Bool">
+diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/kwin.kdev4 kwin/kwin.kdev4
+--- kwin-5.15.5/kwin.kdev4	2019-05-09 15:34:03.230152980 -0500
++++ kwin/kwin.kdev4	1969-12-31 19:00:00.000000000 -0500
+@@ -1,4 +0,0 @@
+-[Project]
+-CreatedFrom=CMakeLists.txt
+-Manager=KDevCMakeManager
+-Name=kwin
+diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/layers.cpp kwin/layers.cpp
+--- kwin-5.15.5/layers.cpp	2019-05-07 04:55:42.000000000 -0500
++++ kwin/layers.cpp	2019-05-19 13:42:11.232867889 -0500
+@@ -722,6 +722,9 @@
+     if (m_xStackingDirty) {
+         const_cast<Workspace*>(this)->updateXStackingOrder();
+     }
++    if (m_compositor) {
++        const_cast< Workspace* >(this)->m_compositor->checkUnredirect();
++    }
+     return x_stacking;
+ }
+ 
+diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/options.cpp kwin/options.cpp
+--- kwin-5.15.5/options.cpp	2019-05-07 04:55:42.000000000 -0500
++++ kwin/options.cpp	2019-05-07 15:22:18.692840931 -0500
+@@ -114,6 +114,7 @@
+     , m_useCompositing(Options::defaultUseCompositing())
+     , m_compositingInitialized(Options::defaultCompositingInitialized())
+     , m_hiddenPreviews(Options::defaultHiddenPreviews())
++    , m_unredirectFullscreen(Options::defaultUnredirectFullscreen())
+     , m_glSmoothScale(Options::defaultGlSmoothScale())
+     , m_xrenderSmoothScale(Options::defaultXrenderSmoothScale())
+     , m_maxFpsInterval(Options::defaultMaxFpsInterval())
+@@ -125,6 +126,10 @@
+     , m_glPreferBufferSwap(Options::defaultGlPreferBufferSwap())
+     , m_glPlatformInterface(Options::defaultGlPlatformInterface())
+     , m_windowsBlockCompositing(true)
++    , m_animationCurve(Options::defaultAnimationCurve())
++    , m_latencyControl(Options::defaultLatencyControl())
++    , m_maxLatency(Options::defaultMaxLatency())
++    , m_minLatency(Options::defaultMinLatency())
+     , OpTitlebarDblClick(Options::defaultOperationTitlebarDblClick())
+     , CmdActiveTitlebar1(Options::defaultCommandActiveTitlebar1())
+     , CmdActiveTitlebar2(Options::defaultCommandActiveTitlebar2())
+@@ -633,6 +638,20 @@
+     emit hiddenPreviewsChanged();
+ }
+ 
++void Options::setUnredirectFullscreen(bool unredirectFullscreen)
++{
++    //if (GLPlatform::instance()->driver() == Driver_Intel)
++        //unredirectFullscreen = false; // bug #252817
++    if (m_unredirectFullscreen == unredirectFullscreen) {
++        return;
++    }
++    //if (GLPlatform::instance()->driver() == Driver_Intel) { // write back the value
++        //KConfigGroup(m_settings->config(), "Compositing").writeEntry("UnredirectFullscreen", false);
++    //}
++    m_unredirectFullscreen = unredirectFullscreen;
++    emit unredirectFullscreenChanged();
++}
++
+ void Options::setGlSmoothScale(int glSmoothScale)
+ {
+     if (m_glSmoothScale == glSmoothScale) {
+@@ -714,6 +733,38 @@
+     emit windowsBlockCompositingChanged();
+ }
+ 
++void Options::setAnimationCurve(int val) {
++  if (m_animationCurve == val) {
++    return;
++  }
++  m_animationCurve = val;
++  emit animationCurveChanged();
++}
++
++void Options::setLatencyControl(int val) {
++  if (m_latencyControl == val) {
++    return;
++  }
++  m_latencyControl = val;
++  emit latencyControlChanged();
++}
++
++void Options::setMaxLatency(int val) {
++  if (m_maxLatency == val) {
++    return;
++  }
++  m_maxLatency = val;
++  emit maxLatencyChanged();
++}
++
++void Options::setMinLatency(int val) {
++  if (m_minLatency == val) {
++    return;
++  }
++  m_minLatency = val;
++  emit minLatencyChanged();
++}
++
+ void Options::setGlPreferBufferSwap(char glPreferBufferSwap)
+ {
+     if (glPreferBufferSwap == 'a') {
+@@ -888,6 +939,10 @@
+     setElectricBorderCornerRatio(m_settings->electricBorderCornerRatio());
+     setWindowsBlockCompositing(m_settings->windowsBlockCompositing());
+ 
++    setAnimationCurve(m_settings->animationCurve());
++    setLatencyControl(m_settings->latencyControl());
++    setMaxLatency(m_settings->maxLatency());
++    setMinLatency(m_settings->minLatency());
+ }
+ 
+ bool Options::loadCompositingConfig (bool force)
+@@ -991,7 +1046,8 @@
+         previews = HiddenPreviewsAlways;
+     setHiddenPreviews(previews);
+ 
+-    // TOOD: add setter
++    setUnredirectFullscreen(config.readEntry("UnredirectFullscreen", Options::defaultUnredirectFullscreen()));
++    // TODO: add setter
+     animationSpeed = qBound(0, config.readEntry("AnimationSpeed", Options::defaultAnimationSpeed()), 6);
+ 
+     auto interfaceToKey = [](OpenGLPlatformInterface interface) {
+@@ -1145,4 +1201,9 @@
+     return m_useCompositing || kwinApp()->platform()->requiresCompositing();
+ }
+ 
++bool Options::isUnredirectFullscreen() const
++{
++    return m_unredirectFullscreen && !kwinApp()->platform()->requiresCompositing();
++}
++
+ } // namespace
+diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/options.h kwin/options.h
+--- kwin-5.15.5/options.h	2019-05-07 04:55:42.000000000 -0500
++++ kwin/options.h	2019-05-19 13:42:11.302867885 -0500
+@@ -169,6 +169,7 @@
+     Q_PROPERTY(bool useCompositing READ isUseCompositing WRITE setUseCompositing NOTIFY useCompositingChanged)
+     Q_PROPERTY(bool compositingInitialized READ isCompositingInitialized WRITE setCompositingInitialized NOTIFY compositingInitializedChanged)
+     Q_PROPERTY(int hiddenPreviews READ hiddenPreviews WRITE setHiddenPreviews NOTIFY hiddenPreviewsChanged)
++    Q_PROPERTY(bool unredirectFullscreen READ isUnredirectFullscreen WRITE setUnredirectFullscreen NOTIFY unredirectFullscreenChanged)
+     /**
+      * 0 = no, 1 = yes when transformed,
+      * 2 = try trilinear when transformed; else 1,
+@@ -550,6 +551,7 @@
+     HiddenPreviews hiddenPreviews() const {
+         return m_hiddenPreviews;
+     }
++    bool isUnredirectFullscreen() const;
+     // OpenGL
+     // 0 = no, 1 = yes when transformed,
+     // 2 = try trilinear when transformed; else 1,
+@@ -594,6 +596,18 @@
+     {
+         return m_windowsBlockCompositing;
+     }
++    int animationCurve() const {
++      return m_animationCurve;
++    }
++    int latencyControl() const {
++      return m_latencyControl;
++    }
++    int maxLatency() const {
++      return m_maxLatency;
++    }
++    int minLatency() const {
++      return m_minLatency;
++    }
+ 
+     QStringList modifierOnlyDBusShortcut(Qt::KeyboardModifier mod) const;
+ 
+@@ -648,6 +662,7 @@
+     void setUseCompositing(bool useCompositing);
+     void setCompositingInitialized(bool compositingInitialized);
+     void setHiddenPreviews(int hiddenPreviews);
++    void setUnredirectFullscreen(bool unredirectFullscreen);
+     void setGlSmoothScale(int glSmoothScale);
+     void setXrenderSmoothScale(bool xrenderSmoothScale);
+     void setMaxFpsInterval(qint64 maxFpsInterval);
+@@ -659,6 +674,10 @@
+     void setGlPreferBufferSwap(char glPreferBufferSwap);
+     void setGlPlatformInterface(OpenGLPlatformInterface interface);
+     void setWindowsBlockCompositing(bool set);
++    void setAnimationCurve(int curve);
++    void setLatencyControl(int index);
++    void setMaxLatency(int val);
++    void setMinLatency(int val);
+ 
+     // default values
+     static WindowOperation defaultOperationTitlebarDblClick() {
+@@ -736,6 +755,9 @@
+     static HiddenPreviews defaultHiddenPreviews() {
+         return HiddenPreviewsShown;
+     }
++    static bool defaultUnredirectFullscreen() {
++        return true;
++    }
+     static int defaultGlSmoothScale() {
+         return 2;
+     }
+@@ -772,6 +794,18 @@
+     static int defaultAnimationSpeed() {
+         return 3;
+     }
++    static int defaultAnimationCurve() {
++      return 2;
++    }
++    static int defaultLatencyControl() {
++      return 1;
++    }
++    static int defaultMaxLatency() {
++      return 8;
++    }
++    static int defaultMinLatency() {
++      return 0;
++    }
+ 
+     /**
+      * Performs loading all settings except compositing related.
+@@ -839,6 +873,7 @@
+     void useCompositingChanged();
+     void compositingInitializedChanged();
+     void hiddenPreviewsChanged();
++    void unredirectFullscreenChanged();
+     void glSmoothScaleChanged();
+     void xrenderSmoothScaleChanged();
+     void maxFpsIntervalChanged();
+@@ -850,6 +885,10 @@
+     void glPreferBufferSwapChanged();
+     void glPlatformInterfaceChanged();
+     void windowsBlockCompositingChanged();
++    void animationCurveChanged();
++    void latencyControlChanged();
++    void maxLatencyChanged();
++    void minLatencyChanged();
+ 
+     void configChanged();
+ 
+@@ -884,6 +923,7 @@
+     bool m_useCompositing;
+     bool m_compositingInitialized;
+     HiddenPreviews m_hiddenPreviews;
++    bool m_unredirectFullscreen;
+     int m_glSmoothScale;
+     bool m_xrenderSmoothScale;
+     qint64 m_maxFpsInterval;
+@@ -896,6 +936,10 @@
+     GlSwapStrategy m_glPreferBufferSwap;
+     OpenGLPlatformInterface m_glPlatformInterface;
+     bool m_windowsBlockCompositing;
++    int m_animationCurve;
++    int m_latencyControl;
++    int m_maxLatency;
++    int m_minLatency;
+ 
+     WindowOperation OpTitlebarDblClick;
+     WindowOperation opMaxButtonRightClick = defaultOperationMaxButtonRightClick();
+diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/patches kwin/patches
+--- kwin-5.15.5/patches	2019-05-09 15:34:03.233486314 -0500
++++ kwin/patches	1969-12-31 19:00:00.000000000 -0500
+@@ -1,33 +0,0 @@
+-diff --git a/composite.cpp b/composite.cpp
+-index f8e5f40e9..50ffe146d 100644
+---- a/composite.cpp
+-+++ b/composite.cpp
+-@@ -77,7 +77,7 @@ namespace KWin
+- 
+- extern int currentRefreshRate();
+- 
+--int LastPaintFree;
+-+int LastPaintFree=8000;
+- 
+- CompositorSelectionOwner::CompositorSelectionOwner(const char *selection) : KSelectionOwner(selection, connection(), rootWindow()), owning(false)
+- {
+-@@ -806,7 +806,7 @@ drm_wait_vblank_t vblank;
+-            *((int*)&vblank.request.type )&=~_DRM_VBLANK_RELATIVE;
+-          }
+-          while (retval == -1 && errno == EINTR);
+--         LastPaintFree=8000;
+-+         //LastPaintFree=8000;
+-          usleep(LastPaintFree);
+-            scheduleRepaint();
+-     }
+-@@ -921,6 +921,10 @@ void Compositor::setCompositeTimer()
+-             waitTime = 1; // ... "0" would be sufficient, but the compositor isn't the WMs only task
+-         }
+-     }
+-+    //printf("waitTime: %d\n",waitTime);
+-+    if (waitTime<5) waitTime=5;
+-+    LastPaintFree=fmin((waitTime*1000)-5000,LastPaintFree+200);
+-+    //printf("LPF: %d\n",LastPaintFree);
+-     waitTime=0;
+-     compositeTimer.start(qMin(waitTime, 250u), this); // force 4fps minimum
+- }
+diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/patches1 kwin/patches1
+--- kwin-5.15.5/patches1	2019-05-09 15:34:03.233486314 -0500
++++ kwin/patches1	1969-12-31 19:00:00.000000000 -0500
+@@ -1,33 +0,0 @@
+-diff --git a/composite.cpp b/composite.cpp
+-index 50ffe146d..fd3bb263e 100644
+---- a/composite.cpp
+-+++ b/composite.cpp
+-@@ -78,6 +78,7 @@ namespace KWin
+- extern int currentRefreshRate();
+- 
+- int LastPaintFree=8000;
+-+float totalSkips=0;
+- 
+- CompositorSelectionOwner::CompositorSelectionOwner(const char *selection) : KSelectionOwner(selection, connection(), rootWindow()), owning(false)
+- {
+-@@ -923,8 +924,18 @@ void Compositor::setCompositeTimer()
+-     }
+-     //printf("waitTime: %d\n",waitTime);
+-     if (waitTime<5) waitTime=5;
+--    LastPaintFree=fmin((waitTime*1000)-5000,LastPaintFree+200);
+--    //printf("LPF: %d\n",LastPaintFree);
+-+    totalSkips-=0.004;
+-+    if (totalSkips<0) {
+-+      totalSkips=0;
+-+    }
+-+    if ((signed)(LastPaintFree-2000)>(signed)((waitTime*1000)-5000)) {
+-+      totalSkips++;
+-+    }
+-+    LastPaintFree=fmin((waitTime*1000)-5000,LastPaintFree+(200-totalSkips*20));
+-+    if (LastPaintFree<1) {
+-+      LastPaintFree=1;
+-+    }
+-+    printf("LPF: %d ts: %.2f\n",LastPaintFree,totalSkips);
+-     waitTime=0;
+-     compositeTimer.start(qMin(waitTime, 250u), this); // force 4fps minimum
+- }
+diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/patch.sh kwin/patch.sh
+--- kwin-5.15.5/patch.sh	1969-12-31 19:00:00.000000000 -0500
++++ kwin/patch.sh	2019-06-12 14:40:42.696213006 -0500
+@@ -0,0 +1,14 @@
++#!/bin/bash
++
++klpath=${PWD##*/}
++actualVer=5.15.5
++minorVer=2
++version=$(sed -rn "s/^set\(PROJECT_VERSION \"([0-9.]+)\"\)$/\1/p" CMakeLists.txt)
++
++cd ..
++if [ ! -e kwin-$actualVer.tar.xz ]
++  then wget https://download.kde.org/stable/plasma/$actualVer/kwin-$actualVer.tar.xz || exit 1
++fi
++
++tar -xf kwin-$actualVer.tar.xz
++diff -ruNx .git -x build -x .kdev4 -x po kwin-$actualVer $klpath > kwin-lowlatency-$version-$minorVer.patch
+diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/platformsupport/scenes/opengl/abstract_egl_backend.cpp kwin/platformsupport/scenes/opengl/abstract_egl_backend.cpp
+--- kwin-5.15.5/platformsupport/scenes/opengl/abstract_egl_backend.cpp	2019-05-07 04:55:42.000000000 -0500
++++ kwin/platformsupport/scenes/opengl/abstract_egl_backend.cpp	2019-05-19 13:42:11.306201219 -0500
+@@ -131,6 +131,8 @@
+ {
+     GLPlatform *glPlatform = GLPlatform::instance();
+     glPlatform->detect(EglPlatformInterface);
++    //if (GLPlatform::instance()->driver() == Driver_Intel)
++        //options->setUnredirectFullscreen(false); // bug #252817 which I'm not fixing yet
+     options->setGlPreferBufferSwap(options->glPreferBufferSwap()); // resolve autosetting
+     if (options->glPreferBufferSwap() == Options::AutoSwapStrategy)
+         options->setGlPreferBufferSwap('e'); // for unknown drivers - should not happen
+diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/plugins/platforms/x11/standalone/glxbackend.cpp kwin/plugins/platforms/x11/standalone/glxbackend.cpp
+--- kwin-5.15.5/plugins/platforms/x11/standalone/glxbackend.cpp	2019-05-07 04:55:42.000000000 -0500
++++ kwin/plugins/platforms/x11/standalone/glxbackend.cpp	2019-06-12 14:39:30.172877515 -0500
+@@ -206,6 +206,16 @@
+     // Initialize OpenGL
+     GLPlatform *glPlatform = GLPlatform::instance();
+     glPlatform->detect(GlxPlatformInterface);
++    //if (GLPlatform::instance()->driver() == Driver_Intel)
++        //options->setUnredirectFullscreen(false); // bug #252817
++    // HACK! please replace with a better solution soon
++    if (GLPlatform::instance()->driver() == Driver_Intel) {
++      useHorribleHack=true; // issue #13
++    }
++    // NVIDIA doesn't freeze on that wait sync function
++    if (GLPlatform::instance()->driver() == Driver_NVidia) {
++      useWaitSync=true; // issue #17
++    }
+     options->setGlPreferBufferSwap(options->glPreferBufferSwap()); // resolve autosetting
+     if (options->glPreferBufferSwap() == Options::AutoSwapStrategy)
+         options->setGlPreferBufferSwap('e'); // for unknown drivers - should not happen
+@@ -245,24 +255,21 @@
+     const bool wantSync = options->glPreferBufferSwap() != Options::NoSwapEncourage;
+     if (wantSync && glXIsDirect(display(), ctx)) {
+         if (haveSwapInterval) { // glXSwapInterval is preferred being more reliable
+-            setSwapInterval(1);
+-            setSyncsToVBlank(true);
+-            const QByteArray tripleBuffer = qgetenv("KWIN_TRIPLE_BUFFER");
+-            if (!tripleBuffer.isEmpty()) {
+-                setBlocksForRetrace(qstrcmp(tripleBuffer, "0") == 0);
+-                gs_tripleBufferUndetected = false;
+-            }
+-            gs_tripleBufferNeedsDetection = gs_tripleBufferUndetected;
+-        } else if (hasExtension(QByteArrayLiteral("GLX_SGI_video_sync"))) {
++            setSwapInterval(1); // but adds latency. see below
++        } else {
++          qCWarning(KWIN_X11STANDALONE) << "TEARING ALERT! unable to set swap interval";
++        }
++        if (hasExtension(QByteArrayLiteral("GLX_SGI_video_sync"))) {
++            // we still need this extension for lowering latency.
+             unsigned int sync;
+             if (glXGetVideoSyncSGI(&sync) == 0 && glXWaitVideoSyncSGI(1, 0, &sync) == 0) {
+                 setSyncsToVBlank(true);
+                 setBlocksForRetrace(true);
+                 haveWaitSync = true;
+             } else
+-                qCWarning(KWIN_X11STANDALONE) << "NO VSYNC! glXSwapInterval is not supported, glXWaitVideoSync is supported but broken";
++                qCWarning(KWIN_X11STANDALONE) << "HIGH LATENCY ALERT! glXWaitVideoSync is supported but broken";
+         } else
+-            qCWarning(KWIN_X11STANDALONE) << "NO VSYNC! neither glSwapInterval nor glXWaitVideoSync are supported";
++            qCWarning(KWIN_X11STANDALONE) << "HIGH LATENCY ALERT! glXWaitVideoSync is not supported";
+     } else {
+         // disable v-sync (if possible)
+         setSwapInterval(0);
+@@ -705,7 +712,7 @@
+                 }
+             }
+         } else {
+-            waitSync();
++            if (useWaitSync) waitSync();
+             glXSwapBuffers(display(), glxWindow);
+         }
+         if (supportsBufferAge()) {
+@@ -722,6 +729,23 @@
+         copyPixels(lastDamage());
+         glDrawBuffer(GL_BACK);
+     }
++    if (useHorribleHack) {
++      // HACK HACK HACK! please replace with a better solution soon
++      unsigned int oldSync, sync;
++      glXGetVideoSyncSGI(&sync);
++      oldSync=sync;
++      while (1) {
++        glXGetVideoSyncSGI(&sync);
++        if (sync!=oldSync) break;
++        usleep(1000);
++      }
++    } else {
++      if (useWaitSync) {
++        waitSync();
++      } else {
++        glFinish();
++      }
++    }
+ 
+     setLastDamage(QRegion());
+     if (!supportsBufferAge()) {
+@@ -795,15 +819,8 @@
+ 
+     setLastDamage(renderedRegion);
+ 
+-    if (!blocksForRetrace()) {
+-        // This also sets lastDamage to empty which prevents the frame from
+-        // being posted again when prepareRenderingFrame() is called.
+-        present();
+-    } else {
+-        // Make sure that the GPU begins processing the command stream
+-        // now and not the next time prepareRenderingFrame() is called.
+-        glFlush();
+-    }
++    // just present. this is the culprit.
++    present();
+ 
+     if (overlayWindow()->window())  // show the window only after the first pass,
+         overlayWindow()->show();   // since that pass may take long
+diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/plugins/platforms/x11/standalone/glxbackend.h kwin/plugins/platforms/x11/standalone/glxbackend.h
+--- kwin-5.15.5/plugins/platforms/x11/standalone/glxbackend.h	2019-05-07 04:55:42.000000000 -0500
++++ kwin/plugins/platforms/x11/standalone/glxbackend.h	2019-06-12 14:39:30.192877516 -0500
+@@ -118,6 +118,8 @@
+     bool m_haveINTELSwapEvent = false;
+     bool haveSwapInterval = false;
+     bool haveWaitSync = false;
++    bool useHorribleHack = false;
++    bool useWaitSync = false;
+     Display *m_x11Display;
+     SwapProfiler m_swapProfiler;
+     friend class GlxTexture;
+diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/README.md kwin/README.md
+--- kwin-5.15.5/README.md	2019-05-07 04:55:42.000000000 -0500
++++ kwin/README.md	2019-06-12 14:39:30.172877515 -0500
+@@ -1,48 +1,197 @@
+-# KWin
++# KWin-lowlatency
+ 
+-KWin is an easy to use, but flexible, composited Window Manager for Xorg windowing systems (Wayland, X11) on Linux. Its primary usage is in conjunction with a Desktop Shell (e.g. KDE Plasma Desktop). KWin is designed to go out of the way; users should not notice that they use a window manager at all. Nevertheless KWin provides a steep learning curve for advanced features, which are available, if they do not conflict with the primary mission. KWin does not have a dedicated targeted user group, but follows the targeted user group of the Desktop Shell using KWin as it's window manager.
++KWin-lowlatency is my attempt to reduce latency and stuttering in the popular KWin compositor used in KDE.
+ 
+-## KWin is not...
++## background
+ 
+- * a standalone window manager (c.f. openbox, i3) and does not provide any functionality belonging to a Desktop Shell.
+- * a replacement for window managers designed for use with a specific Desktop Shell (e.g. GNOME Shell)
+- * a minimalistic window manager
+- * designed for use without compositing or for X11 network transparency, though both are possible.
++stock KWin has a major issue regarding stuttering. it stutters heavily, and if you don't want that, then you have the latency problem (of up to 50ms!).
+ 
+-# Contacting KWin development team
++the rationale for such a problem is that KWin uses a weird method to paint the screen.
++instead of simply sync'ing to vblank, it uses a timer. yeah, a **timer** that is off-sync with the vblank interval.
++you can prove this by disabling VSync in the system settings. you'll see just 1 line of tearing in your screen, and well, that's the time it swaps due to the timer.
++
++in order to "fix" this under vanilla KWin, a typical solution is to insert this in kwinrc:
++
++```
++MaxFPS=200
++RefreshRate=200
++```
++
++effectively making the timer faster than the actual screen's rate, forcing VSync at some point.
++
++however, this introduces additional output lag, which varies depending on your driver, but usually it's 50ms (still too high).
++you can prove this by moving a window. you'll see the cursor being ahead of the title bar, or at least so under X.
++
++so, how to fix this? let's ditch the timer and let us access the VBlank interval directly.
++
++but how do we do that? by using glFinish.
++
++this is a much, **much** better solution over glXWaitVideoSyncSGI, as it achieves the same effect, doesn't have a chance of freezing under Mesa, and may work under EGL on X and Wayland.
++
++now, by doing this, we have a proper desktop without stuttering, but the lag persists...
++
++after digging deep into the code, i found this piece of code in particular, which is pretty much the culprit:
++
++```
++if (!blocksForRetrace()) {
++  // This also sets lastDamage to empty which prevents the frame from
++  // being posted again when prepareRenderingFrame() is called.
++  present();
++} else {
++  // Make sure that the GPU begins processing the command stream
++  // now and not the next time prepareRenderingFrame() is called.
++  glFlush();
++}
++```
++
++by removing this code and simply presenting as soon as possible (we're blocking for retrace anyway due to the glFinish thingy), we cut off 1 whole frame of lag!
++
++but hey, can we go further? yes, of course!
++
++now, by sleeping for a very few milliseconds (up to 8 in high-end systems) the compositor has more time for user input before rendering, which further reduces latency.
++
++the reason why only up to 8ms is because any further would leave little room for rendering, and that will actually produce more stuttering than fix it.
++
++## KWin-lowlatency is not...
++
++* perfect. it tries its best to deliver low-latency no-stutter video, but I can't promise this is always the case.
++  as an example, it will stutter if you select another window, or if you have too many windows open.
++* truly designed for low-end systems. if you use KWin-lowlatency in one of them, you may experience stuttering.
++
++# installation
++
++## Arch Linux
++
++[kwin-lowlatency is available in the AUR](https://aur.archlinux.org/packages/kwin-lowlatency).
++
++## Fedora
++
++ZaWertun provides pre-compiled packages [in the Copr](https://copr.fedorainfracloud.org/coprs/zawertun/kde/package/kwin-lowlatency/).
++
++## Gentoo
++
++[an overlay](https://github.com/agates/kwin-lowlatency-overlay) is available, courtesy of agates.
++
++## openSUSE Tumbleweed
++
++kwin-lowlatency can be found at [home:KAMiKAZOW:KDE](https://software.opensuse.org/download.html?project=home%3AKAMiKAZOW%3AKDE&package=kwin-lowlatency) (OBS).
++
++## other distributions/manual method
++
++you can compile/install this yourself if your distro isn't listed here (yes, I know Ubuntu is missing) or if you want to.
++
++### acquiring the source
++
++you can get the source code by using any of the following 2 methods:
++
++#### git repo clone
++
++```
++$ git clone https://github.com/tildearrow/kwin-lowlatency.git
++$ cd kwin-lowlatency
++```
++
++you may want to check the current stable version out:
++
++```
++$ git checkout v5.15.5
++```
++
++#### patch format
++
++download stock KWin source and patch file:
++
++```
++$ wget https://download.kde.org/stable/plasma/5.15.5/kwin-5.15.5.tar.xz
++$ wget http://tildearrow.zapto.org/storage/kwin-lowlatency/kwin-lowlatency-5.15.5.patch
++```
++
++extract:
++
++```
++$ tar -xvf kwin-5.15.5.tar.xz
++```
++
++patch:
++
++```
++$ cd kwin-5.15.5
++$ patch -p1 < ../kwin-lowlatency-5.15.5.patch
++```
++
++### building
++
++```
++$ mkdir build
++$ cd build
++$ cmake -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_INSTALL_LIBDIR=lib -DCMAKE_INSTALL_LIBEXECDIR=lib -DBUILD_TESTING=OFF
++$ make
++```
++
++### installing
++
++```
++$ sudo make install
++```
++
++# contacting original KWin development team
+ 
+  * mailing list: [kwin@kde.org](https://mail.kde.org/mailman/listinfo/kwin)
+  * IRC: #kwin on freenode
+ 
+-# Support
+-## Application Developer
+-If you are an application developer having questions regarding windowing systems (either X11 or Wayland) please do not hesitate to contact us. Preferable through our mailing list. Ideally subscribe to the mailing list, so that your mail doesn't get stuck in the moderation queue.
++# additional options menu
+ 
+-## End user
+-Please contact the support channels of your Linux distribution for user support. The KWin development team does not provide end user support.
++KWin-lowlatency introduces few extra options in System Settings > Display and Monitor > Compositor. these are:
+ 
+-# Reporting bugs
++- animation curve: allows you to make animations look smoother. I have a gripe with linear animations, hence this option. i'll post a video about this later.
++- latency/stutter control: use if you have a high-end system and want lower latency, or if you're having stuttering and want to reduce it.
++- maximum/minimum latency reduction: allows you to configure the latency reduction window. examples (min/max): 8/0 default, 0/0 disable latency reduction, and 8/8 lowest latency possible. this is limited to 8ms, since any further would cause major stuttering and slowdowns.
+ 
+-Please use [KDE's bugtracker](https://bugs.kde.org) and report for [product KWin](https://bugs.kde.org/enter_bug.cgi?product=kwin).
++# misc/FAQ
+ 
+-# Developing on KWin
+-Please refer to [hacking documentation](HACKING.md) for how to build and start KWin. Further information about KWin's test suite can be found in [TESTING.md](TESTING.md).
++> Ubuntu Ubuntu Ubuntu
++
++i'm working on it...
+ 
+-## Guidelines for new features
++> what's this "Paint cursor" effect in Desktop Effects?
+ 
+-A new Feature can only be added to KWin if:
++it's an effect I wrote back in 2018 when experimenting with kmsgrab for some private recordings.
++it basically redraws the cursor. this may seem redundant, but actually is helpful for recording with kmsgrab (since it doesn't draw the hardware sprite).
+ 
+- * it does not violate the primary missions as stated at the start of this document
+- * it does not introduce instabilities
+- * it is maintained, that is bugs are fixed in a timely manner (second next minor release) if it is not a corner case.
+- * it works together with all existing features
+- * it supports both single and multi screen (xrandr)
+- * it adds a significant advantage
+- * it is feature complete, that is supports at least all useful features from competitive implementations
+- * it is not a special case for a small user group
+- * it does not increase code complexity significantly
+- * it does not affect KWin's license (GPLv2+)
++> will this work under Wayland?
+ 
+-All new added features are under probation, that is if any of the non-functional requirements as listed above do not hold true in the next two feature releases, the added feature will be removed again.
++no, it won't, but I am working on it. so far using DRM VBlank only showed negative results, with applications running at half speed. now i'm trying again with glFinish and friends...
++
++> i'm using the `modesetting` driver (instead of the `amdgpu` DDX driver) under an AMD card, and can see some latency. how do I fix this?
++
++an option will come soon.
++
++> do you have any plans to upstream this?
++
++at this moment, not really:
++
++- i still can't ensure this will work everywhere (but it should).
++- this patchset brings full-screen unredirection back, which is a feature the KDE devs definitely [don't want to see in upstream](https://blog.martin-graesslin.com/blog/2016/08/opengl-changes-in-kwin-compositing/) since they have another "approach" (allow apps to block compositing).
++  - the problem with their approach is that it means every app must support it in order to work, which is something not every app does. on the other hand, unredirection works for most apps, and doesn't require developers to change their code for it to work.
++  - another problem is that instead of suspending compositing, it **disables** compositing. this means you get to see a few frames of an ugly desktop when the app quits. this doesn't happen with unredirection.
++- furthermore, this also brings back "close" option in Present Windows, which once again the KDE devs despise.
++
++> unredirection is not working.
++
++please see [unredirect.md](https://github.com/tildearrow/kwin-lowlatency/blob/Plasma/5.15/unredirect.md) for known issues. you may file a bug report as well.
++
++# support
++
++use the issues section at the top.
++
++# bugs?
++
++use the issues section at the top. **but wait!** before reporting an issue, first test it again on [the official KWin](https://cgit.kde.org/kwin.git/) to determine whether this is really a KWin-lowlatency-only bug.
++
++if the bug also reproduces in official KWin, please file a bug on [their bug tracker](https://bugs.kde.org/enter_bug.cgi?product=kwin) instead.
++
++# Developing on KWin
++
++Please refer to [hacking documentation](HACKING.md) for how to build and start KWin. Further information about KWin's test suite can be found in [TESTING.md](TESTING.md).
+ 
+-The same non functional requirements hold true for any kind of plugins (effects, scripts, etc.). It is suggested to use scripted plugins and distribute them separately.
++no, sorry, there are no tests for the low-latency features yet.
+diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/scene.cpp kwin/scene.cpp
+--- kwin-5.15.5/scene.cpp	2019-05-07 04:55:42.000000000 -0500
++++ kwin/scene.cpp	2019-05-19 13:42:11.356201217 -0500
+@@ -233,6 +233,9 @@
+             continue;
+         }
+         phase2.append({w, infiniteRegion(), data.clip, data.mask, data.quads});
++        // transformations require window pixmap
++        w->suspendUnredirect(data.mask
++                             & (PAINT_WINDOW_TRANSLUCENT | PAINT_SCREEN_TRANSFORMED | PAINT_WINDOW_TRANSFORMED));
+     }
+ 
+     foreach (const Phase2Data & d, phase2) {
+@@ -306,11 +309,14 @@
+         }
+ #endif
+         if (!w->isPaintingEnabled()) {
++            w->suspendUnredirect(true);
+             continue;
+         }
+         dirtyArea |= data.paint;
+         // Schedule the window for painting
+         phase2data.append({w, data.paint, data.clip, data.mask, data.quads});
++        // no transformations, but translucency requires window pixmap
++        w->suspendUnredirect(data.mask & PAINT_WINDOW_TRANSLUCENT);
+     }
+ 
+     // Save the part of the repaint region that's exclusively rendered to
+diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/scene.h kwin/scene.h
+--- kwin-5.15.5/scene.h	2019-05-07 04:55:42.000000000 -0500
++++ kwin/scene.h	2019-05-19 13:42:11.356201217 -0500
+@@ -325,6 +325,7 @@
+     void updateToplevel(Toplevel* c);
+     // creates initial quad list for the window
+     virtual WindowQuadList buildQuads(bool force = false) const;
++    void suspendUnredirect(bool suspend);
+     void updateShadow(Shadow* shadow);
+     const Shadow* shadow() const;
+     Shadow* shadow();
+@@ -585,6 +586,12 @@
+ }
+ 
+ inline
++void Scene::Window::suspendUnredirect(bool suspend)
++{
++    toplevel->suspendUnredirect(suspend);
++}
++
++inline
+ const Shadow* Scene::Window::shadow() const
+ {
+     return m_shadow;
+diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/scripting/scriptedeffect.cpp kwin/scripting/scriptedeffect.cpp
+--- kwin-5.15.5/scripting/scriptedeffect.cpp	2019-05-07 04:55:42.000000000 -0500
++++ kwin/scripting/scriptedeffect.cpp	2019-05-18 16:10:42.758150219 -0500
+@@ -153,7 +153,21 @@
+         settings.curve = static_cast<QEasingCurve::Type>(curve.toInt32());
+         settings.set |= AnimationSettings::Curve;
+     } else {
+-        settings.curve = QEasingCurve::Linear;
++#ifndef KWINLL_NO_OPTIONS
++      switch (options->animationCurve()) {
++        case 1:
++          settings.curve = QEasingCurve::InOutQuad;
++          break;
++        case 2:
++          settings.curve = QEasingCurve::InOutSine;
++          break;
++        default:
++          settings.curve = QEasingCurve::Linear;
++          break;
++      }
++#else
++      settings.curve = QEasingCurve::InOutSine;
++#endif
+     }
+ 
+     QScriptValue type = object.property(QStringLiteral("type"));
+diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/shell_client.cpp kwin/shell_client.cpp
+--- kwin-5.15.5/shell_client.cpp	2019-05-07 04:55:42.000000000 -0500
++++ kwin/shell_client.cpp	2019-05-19 13:42:11.359534549 -0500
+@@ -459,6 +459,12 @@
+     return AbstractClient::layerForDock();
+ }
+ 
++bool ShellClient::shouldUnredirect() const
++{
++    // TODO: unredirect for fullscreen
++    return false;
++}
++
+ QRect ShellClient::transparentRect() const
+ {
+     // TODO: implement
+diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/shell_client.h kwin/shell_client.h
+--- kwin-5.15.5/shell_client.h	2019-05-07 04:55:42.000000000 -0500
++++ kwin/shell_client.h	2019-05-19 13:42:11.359534549 -0500
+@@ -64,6 +64,7 @@
+     QPoint clientContentPos() const override;
+     QSize clientSize() const override;
+     QRect transparentRect() const override;
++    bool shouldUnredirect() const override;
+     NET::WindowType windowType(bool direct = false, int supported_types = 0) const override;
+     void debug(QDebug &stream) const override;
+     double opacity() const override;
+diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/toplevel.cpp kwin/toplevel.cpp
+--- kwin-5.15.5/toplevel.cpp	2019-05-07 04:55:42.000000000 -0500
++++ kwin/toplevel.cpp	2019-05-19 13:42:11.362867883 -0500
+@@ -51,6 +51,8 @@
+     , effect_window(NULL)
+     , m_clientMachine(new ClientMachine(this))
+     , wmClientLeaderWin(0)
++    , unredirect(false)
++    , unredirectSuspend(false)
+     , m_damageReplyPending(false)
+     , m_screen(0)
+     , m_skipCloseAnimation(false)
+diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/toplevel.h kwin/toplevel.h
+--- kwin-5.15.5/toplevel.h	2019-05-07 04:55:42.000000000 -0500
++++ kwin/toplevel.h	2019-05-19 13:42:11.362867883 -0500
+@@ -322,6 +322,9 @@
+     bool hasAlpha() const;
+     virtual bool setupCompositing();
+     virtual void finishCompositing(ReleaseReason releaseReason = ReleaseReason::Release);
++    bool updateUnredirectedState();
++    bool unredirected() const;
++    void suspendUnredirect(bool suspend);
+     Q_INVOKABLE void addRepaint(const QRect& r);
+     Q_INVOKABLE void addRepaint(const QRegion& r);
+     Q_INVOKABLE void addRepaint(int x, int y, int w, int h);
+@@ -579,6 +582,7 @@
+     void disownDataPassedToDeleted();
+     friend QDebug& operator<<(QDebug& stream, const Toplevel*);
+     void deleteEffectWindow();
++    virtual bool shouldUnredirect() const = 0;
+     void setDepth(int depth);
+     QRect geom;
+     xcb_visualid_t m_visual;
+@@ -603,6 +607,8 @@
+     QByteArray resource_class;
+     ClientMachine *m_clientMachine;
+     WId wmClientLeaderWin;
++    bool unredirect;
++    bool unredirectSuspend; // when unredirected, but pixmap is needed temporarily
+     bool m_damageReplyPending;
+     QRegion opaque_region;
+     xcb_xfixes_fetch_region_cookie_t m_regionCookie;
+@@ -850,6 +856,11 @@
+     return resource_class; // it is always lowercase
+ }
+ 
++inline bool Toplevel::unredirected() const
++{
++    return unredirect;
++}
++
+ inline const ClientMachine *Toplevel::clientMachine() const
+ {
+     return m_clientMachine;
+diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/unmanaged.h kwin/unmanaged.h
+--- kwin-5.15.5/unmanaged.h	2019-05-07 04:55:42.000000000 -0500
++++ kwin/unmanaged.h	2019-05-19 13:42:11.362867883 -0500
+@@ -52,6 +52,7 @@
+     void release(ReleaseReason releaseReason = ReleaseReason::Release);
+ protected:
+     virtual void debug(QDebug& stream) const;
++    virtual bool shouldUnredirect() const;
+     void addDamage(const QRegion &damage) override;
+ private:
+     virtual ~Unmanaged(); // use release()
+diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/unredirect.md kwin/unredirect.md
+--- kwin-5.15.5/unredirect.md	2019-05-09 15:34:03.240152979 -0500
++++ kwin/unredirect.md	2019-05-18 16:10:42.771483551 -0500
+@@ -23,4 +23,8 @@
+ 
+ - calfjackhost
+ - [latte-dock](https://github.com/tildearrow/kwin-lowlatency/issues/1#issuecomment-483403493) (sometimes)
+-- any Vulkan application. tested with RetroArch and apparently doesn't work. I may be wrong, however.
++- [some Wine applications](https://github.com/tildearrow/kwin-lowlatency/issues/1#issuecomment-491345833). so far reproduces with Battle.net and taskmgr.
++
++the following applications may misbehave when unredirection is enabled:
++
++- some Wine applications. after switching windows they may turn black.
+diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/workspace.cpp kwin/workspace.cpp
+--- kwin-5.15.5/workspace.cpp	2019-05-07 04:55:42.000000000 -0500
++++ kwin/workspace.cpp	2019-05-19 13:42:11.409534547 -0500
+@@ -586,6 +586,10 @@
+     StackingUpdatesBlocker blocker(this);
+     Client* c = new Client();
+     setupClientConnections(c);
++    connect(c, &Client::activeChanged, m_compositor, static_cast<void (Compositor::*)()>(&Compositor::checkUnredirect));
++    connect(c, SIGNAL(fullScreenChanged()), m_compositor, SLOT(checkUnredirect()));
++    connect(c, SIGNAL(geometryChanged()), m_compositor, SLOT(checkUnredirect()));
++    connect(c, SIGNAL(geometryShapeChanged(KWin::Toplevel*,QRect)), m_compositor, SLOT(checkUnredirect()));
+     connect(c, SIGNAL(blockingCompositingChanged(KWin::Client*)), m_compositor, SLOT(updateCompositeBlocking(KWin::Client*)));
+     connect(c, SIGNAL(clientFullScreenSet(KWin::Client*,bool,bool)), ScreenEdges::self(), SIGNAL(checkBlocking()));
+     if (!c->manage(w, is_mapped)) {
