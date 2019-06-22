@@ -6,9 +6,9 @@ pull requests are welcome and encouraged.  i merely created this for my own conv
 
 # using this overlay
 
-## with local overlays
+## with repos.conf
 
-[local overlays](https://wiki.gentoo.org/wiki/Overlay/Local_overlay) should be managed via `/etc/portage/repos.conf/`.
+[/etc/portage/repos.conf](https://wiki.gentoo.org/wiki//etc/portage/repos.conf) can be used.
 to enable this overlay make sure you are using a recent Portage version (at least `2.2.14`), and create a `/etc/portage/repos.conf/kwin-lowlatency-overlay.conf` file containing precisely:
 
 ```
