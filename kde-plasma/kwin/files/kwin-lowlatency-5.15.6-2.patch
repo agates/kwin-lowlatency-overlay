@@ -2369,66 +2369,6 @@ diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/deleted.h kwin/deleted.h
  private Q_SLOTS:
      void mainClientClosed(KWin::Toplevel *client);
      void transientForClosed(Toplevel *toplevel, Deleted *deleted);
-diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/effects/CMakeLists.txt kwin/effects/CMakeLists.txt
---- kwin-5.15.5/effects/CMakeLists.txt	2019-05-07 04:55:42.000000000 -0500
-+++ kwin/effects/CMakeLists.txt	2019-04-21 14:39:10.837350853 -0500
-@@ -87,6 +87,7 @@
-     magnifier/magnifier.cpp
-     mouseclick/mouseclick.cpp
-     mousemark/mousemark.cpp
-+    mousepos/mousepos.cpp
-     presentwindows/presentwindows.cpp
-     presentwindows/presentwindows_proxy.cpp
-     resize/resize.cpp
-@@ -118,6 +119,7 @@
-     magnifier/magnifierconfig.kcfgc
-     mouseclick/mouseclickconfig.kcfgc
-     mousemark/mousemarkconfig.kcfgc
-+    mousepos/mouseposconfig.kcfgc
-     presentwindows/presentwindowsconfig.kcfgc
-     resize/resizeconfig.kcfgc
-     showfps/showfpsconfig.kcfgc
-@@ -182,6 +184,7 @@
- add_subdirectory( magnifier )
- add_subdirectory( mouseclick )
- add_subdirectory( mousemark )
-+add_subdirectory( mousepos )
- include( screenshot/CMakeLists.txt )
- include( sheet/CMakeLists.txt )
- include( snaphelper/CMakeLists.txt )
-diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/effects/effect_builtins.cpp kwin/effects/effect_builtins.cpp
---- kwin-5.15.5/effects/effect_builtins.cpp	2019-05-07 04:55:42.000000000 -0500
-+++ kwin/effects/effect_builtins.cpp	2019-05-19 13:42:10.956201234 -0500
-@@ -54,6 +54,7 @@
- #include "magnifier/magnifier.h"
- #include "mouseclick/mouseclick.h"
- #include "mousemark/mousemark.h"
-+#include "mousepos/mousepos.h"
- #include "sheet/sheet.h"
- #include "snaphelper/snaphelper.h"
- #include "startupfeedback/startupfeedback.h"
-@@ -381,6 +382,21 @@
-         nullptr,
-         nullptr
- #endif
-+EFFECT_FALLBACK
-+    }, {
-+        QStringLiteral("mousepos"),
-+        i18ndc("kwin_effects", "Name of a KWin Effect", "Paint cursor"),
-+        i18ndc("kwin_effects", "Comment describing the KWin Effect", "Redraw the mouse cursor for capturing the display using kmsgrab in FFmpeg"),
-+        QStringLiteral("Tools"),
-+        QString(),
-+        QUrl(),
-+        false,
-+        false,
-+#ifdef EFFECT_BUILTINS
-+        &createHelper<MousePosEffect>,
-+        nullptr,
-+        nullptr
-+#endif
- EFFECT_FALLBACK
-     }, {
-         QStringLiteral("presentwindows"),
 diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/effects/presentwindows/presentwindows_config.ui kwin/effects/presentwindows/presentwindows_config.ui
 --- kwin-5.15.5/effects/presentwindows/presentwindows_config.ui	2019-05-07 04:55:42.000000000 -0500
 +++ kwin/effects/presentwindows/presentwindows_config.ui	2019-04-21 16:07:02.044177566 -0500
@@ -2496,27 +2436,6 @@ diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/effects/presentwindows/pres
      };
      enum DesktopMouseAction {
          DesktopNoAction = 0, // nothing
-diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/effects/shaders.qrc kwin/effects/shaders.qrc
---- kwin-5.15.5/effects/shaders.qrc	2019-05-07 04:55:42.000000000 -0500
-+++ kwin/effects/shaders.qrc	2019-04-21 14:39:11.104017527 -0500
-@@ -6,6 +6,8 @@
-   <file alias="cylinder.vert">cube/data/1.10/cylinder.vert</file>
-   <file alias="sphere.vert">cube/data/1.10/sphere.vert</file>
-   <file alias="invert.frag">invert/data/1.10/invert.frag</file>
-+  <file alias="motion.vert">mousepos/data/1.10/motion.vert</file>
-+  <file alias="motion.frag">mousepos/data/1.10/motion.frag</file>
-   <file alias="lookingglass.frag">lookingglass/data/1.10/lookingglass.frag</file>
-   <file alias="blinking-startup-fragment.glsl">startupfeedback/data/1.10/blinking-startup-fragment.glsl</file>
- </qresource>
-@@ -16,6 +18,8 @@
-   <file alias="cylinder.vert">cube/data/1.40/cylinder.vert</file>
-   <file alias="sphere.vert">cube/data/1.40/sphere.vert</file>
-   <file alias="invert.frag">invert/data/1.40/invert.frag</file>
-+  <file alias="motion.vert">mousepos/data/1.40/motion.vert</file>
-+  <file alias="motion.frag">mousepos/data/1.40/motion.frag</file>
-   <file alias="lookingglass.frag">lookingglass/data/1.40/lookingglass.frag</file>
-   <file alias="blinking-startup-fragment.glsl">startupfeedback/data/1.40/blinking-startup-fragment.glsl</file>
- </qresource>
 diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/effects/zoom/zoom.cpp kwin/effects/zoom/zoom.cpp
 --- kwin-5.15.5/effects/zoom/zoom.cpp	2019-05-07 04:55:42.000000000 -0500
 +++ kwin/effects/zoom/zoom.cpp	2019-05-19 13:42:11.069534562 -0500
@@ -3219,14 +3138,6 @@ diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/kwin.kcfg kwin/kwin.kcfg
      </group>
      <group name="TabBox">
          <entry name="ShowDelay" type="Bool">
-diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/kwin.kdev4 kwin/kwin.kdev4
---- kwin-5.15.5/kwin.kdev4	2019-05-09 15:34:03.230152980 -0500
-+++ kwin/kwin.kdev4	1969-12-31 19:00:00.000000000 -0500
-@@ -1,4 +0,0 @@
--[Project]
--CreatedFrom=CMakeLists.txt
--Manager=KDevCMakeManager
--Name=kwin
 diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/layers.cpp kwin/layers.cpp
 --- kwin-5.15.5/layers.cpp	2019-05-07 04:55:42.000000000 -0500
 +++ kwin/layers.cpp	2019-05-19 13:42:11.232867889 -0500
@@ -3477,80 +3388,6 @@ diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/options.h kwin/options.h
  
      WindowOperation OpTitlebarDblClick;
      WindowOperation opMaxButtonRightClick = defaultOperationMaxButtonRightClick();
-diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/patches kwin/patches
---- kwin-5.15.5/patches	2019-05-09 15:34:03.233486314 -0500
-+++ kwin/patches	1969-12-31 19:00:00.000000000 -0500
-@@ -1,33 +0,0 @@
--diff --git a/composite.cpp b/composite.cpp
--index f8e5f40e9..50ffe146d 100644
----- a/composite.cpp
--+++ b/composite.cpp
--@@ -77,7 +77,7 @@ namespace KWin
-- 
-- extern int currentRefreshRate();
-- 
---int LastPaintFree;
--+int LastPaintFree=8000;
-- 
-- CompositorSelectionOwner::CompositorSelectionOwner(const char *selection) : KSelectionOwner(selection, connection(), rootWindow()), owning(false)
-- {
--@@ -806,7 +806,7 @@ drm_wait_vblank_t vblank;
--            *((int*)&vblank.request.type )&=~_DRM_VBLANK_RELATIVE;
--          }
--          while (retval == -1 && errno == EINTR);
---         LastPaintFree=8000;
--+         //LastPaintFree=8000;
--          usleep(LastPaintFree);
--            scheduleRepaint();
--     }
--@@ -921,6 +921,10 @@ void Compositor::setCompositeTimer()
--             waitTime = 1; // ... "0" would be sufficient, but the compositor isn't the WMs only task
--         }
--     }
--+    //printf("waitTime: %d\n",waitTime);
--+    if (waitTime<5) waitTime=5;
--+    LastPaintFree=fmin((waitTime*1000)-5000,LastPaintFree+200);
--+    //printf("LPF: %d\n",LastPaintFree);
--     waitTime=0;
--     compositeTimer.start(qMin(waitTime, 250u), this); // force 4fps minimum
-- }
-diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/patches1 kwin/patches1
---- kwin-5.15.5/patches1	2019-05-09 15:34:03.233486314 -0500
-+++ kwin/patches1	1969-12-31 19:00:00.000000000 -0500
-@@ -1,33 +0,0 @@
--diff --git a/composite.cpp b/composite.cpp
--index 50ffe146d..fd3bb263e 100644
----- a/composite.cpp
--+++ b/composite.cpp
--@@ -78,6 +78,7 @@ namespace KWin
-- extern int currentRefreshRate();
-- 
-- int LastPaintFree=8000;
--+float totalSkips=0;
-- 
-- CompositorSelectionOwner::CompositorSelectionOwner(const char *selection) : KSelectionOwner(selection, connection(), rootWindow()), owning(false)
-- {
--@@ -923,8 +924,18 @@ void Compositor::setCompositeTimer()
--     }
--     //printf("waitTime: %d\n",waitTime);
--     if (waitTime<5) waitTime=5;
---    LastPaintFree=fmin((waitTime*1000)-5000,LastPaintFree+200);
---    //printf("LPF: %d\n",LastPaintFree);
--+    totalSkips-=0.004;
--+    if (totalSkips<0) {
--+      totalSkips=0;
--+    }
--+    if ((signed)(LastPaintFree-2000)>(signed)((waitTime*1000)-5000)) {
--+      totalSkips++;
--+    }
--+    LastPaintFree=fmin((waitTime*1000)-5000,LastPaintFree+(200-totalSkips*20));
--+    if (LastPaintFree<1) {
--+      LastPaintFree=1;
--+    }
--+    printf("LPF: %d ts: %.2f\n",LastPaintFree,totalSkips);
--     waitTime=0;
--     compositeTimer.start(qMin(waitTime, 250u), this); // force 4fps minimum
-- }
 diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/patch.sh kwin/patch.sh
 --- kwin-5.15.5/patch.sh	1969-12-31 19:00:00.000000000 -0500
 +++ kwin/patch.sh	2019-06-12 14:40:42.696213006 -0500
@@ -4099,19 +3936,6 @@ diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/unmanaged.h kwin/unmanaged.
      void addDamage(const QRegion &damage) override;
  private:
      virtual ~Unmanaged(); // use release()
-diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/unredirect.md kwin/unredirect.md
---- kwin-5.15.5/unredirect.md	2019-05-09 15:34:03.240152979 -0500
-+++ kwin/unredirect.md	2019-05-18 16:10:42.771483551 -0500
-@@ -23,4 +23,8 @@
- 
- - calfjackhost
- - [latte-dock](https://github.com/tildearrow/kwin-lowlatency/issues/1#issuecomment-483403493) (sometimes)
--- any Vulkan application. tested with RetroArch and apparently doesn't work. I may be wrong, however.
-+- [some Wine applications](https://github.com/tildearrow/kwin-lowlatency/issues/1#issuecomment-491345833). so far reproduces with Battle.net and taskmgr.
-+
-+the following applications may misbehave when unredirection is enabled:
-+
-+- some Wine applications. after switching windows they may turn black.
 diff -ruNx .git -x build -x .kdev4 -x po kwin-5.15.5/workspace.cpp kwin/workspace.cpp
 --- kwin-5.15.5/workspace.cpp	2019-05-07 04:55:42.000000000 -0500
 +++ kwin/workspace.cpp	2019-05-19 13:42:11.409534547 -0500
