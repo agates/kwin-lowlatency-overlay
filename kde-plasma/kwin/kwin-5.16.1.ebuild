@@ -90,7 +90,7 @@ RESTRICT+=" test"
 src_prepare() {
 	kde5_src_prepare
 	use multimedia || eapply "${FILESDIR}/${PN}-5.15.80-gstreamer-optional.patch"
-        use lowlatency && eapply "${FILESDIR}/${PN}-lowlatency-5.16.1.patch"
+        use lowlatency && eapply "${FILESDIR}/${PN}-lowlatency-${PV}.patch"
 
 	# Access violations, bug #640432
 	sed -e "s/^ecm_find_qmlmodule.*QtMultimedia/#&/" \
