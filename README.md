@@ -9,7 +9,7 @@ pull requests are welcome and encouraged.  i merely created this for my own conv
 ## with repos.conf
 
 [/etc/portage/repos.conf](https://wiki.gentoo.org/wiki//etc/portage/repos.conf) can be used.
-to enable this overlay make sure you are using a recent Portage version (at least `2.2.14`), and create a `/etc/portage/repos.conf/kwin-lowlatency-overlay.conf` file containing precisely:
+to enable this overlay make sure you are using a recent Portage version (at least `2.2.14`), and create a `/etc/portage/repos.conf/kwin-lowlatency-overlay.conf` file containing precisely (the location can be anywhere you want):
 
 ```
 [kwin-lowlatency-overlay]

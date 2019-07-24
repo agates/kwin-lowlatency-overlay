@@ -10,7 +10,7 @@ inherit kde5
 
 DESCRIPTION="Flexible, composited Window Manager for windowing systems on Linux"
 LICENSE="GPL-2+"
-KEYWORDS="~amd64 ~arm ~arm64 ~x86"
+KEYWORDS="amd64 ~arm arm64 x86"
 IUSE="caps gles2 lowlatency multimedia"
 
 COMMON_DEPEND="
@@ -70,7 +70,6 @@ COMMON_DEPEND="
 	caps? ( sys-libs/libcap )
 "
 RDEPEND="${COMMON_DEPEND}
-	$(add_frameworks_dep kirigami)
 	$(add_qt_dep qtquickcontrols)
 	$(add_qt_dep qtquickcontrols2)
 	$(add_qt_dep qtvirtualkeyboard)
@@ -89,8 +88,8 @@ RESTRICT+=" test"
 
 src_prepare() {
 	kde5_src_prepare
-	use multimedia || eapply "${FILESDIR}/${PN}-5.15.80-gstreamer-optional.patch"
-        use lowlatency && eapply "${FILESDIR}/${PN}-lowlatency-${PV}.patch"
+	use multimedia || eapply "${FILESDIR}/${PN}-gstreamer-optional.patch"
+        use lowlatency && eapply "${FILESDIR}/${PN}-lowlatency-5.15.6-2.patch"
 
 	# Access violations, bug #640432
 	sed -e "s/^ecm_find_qmlmodule.*QtMultimedia/#&/" \
