@@ -54,7 +54,7 @@ COMMON_DEPEND="
 	media-libs/fontconfig
 	media-libs/freetype
 	media-libs/libepoxy
-	media-libs/mesa[egl,gbm,gles2?,wayland]
+	media-libs/mesa[egl,gbm,gles2?,wayland,X(+)]
 	virtual/libudev:=
 	x11-libs/libICE
 	x11-libs/libSM
@@ -90,7 +90,7 @@ RESTRICT+=" test"
 src_prepare() {
 	kde5_src_prepare
 	use multimedia || eapply "${FILESDIR}/${PN}-5.15.80-gstreamer-optional.patch"
-        use lowlatency && eapply "${FILESDIR}/${PN}-lowlatency-5.16.4.patch"
+        use lowlatency && eapply "${FILESDIR}/${PN}-lowlatency-5.16.5.patch"
 
 	# Access violations, bug #640432
 	sed -e "s/^ecm_find_qmlmodule.*QtMultimedia/#&/" \
