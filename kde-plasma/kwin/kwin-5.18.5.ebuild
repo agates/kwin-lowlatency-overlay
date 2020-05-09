@@ -16,7 +16,7 @@ DESCRIPTION="Flexible, composited Window Manager for windowing systems on Linux"
 LICENSE="GPL-2+"
 SLOT="5"
 KEYWORDS="~amd64 ~arm ~arm64 ~ppc64 ~x86"
-IUSE="caps gles2-only lowlatency  multimedia"
+IUSE="caps gles2-only lowlatency multimedia"
 
 COMMON_DEPEND="
 	>=kde-frameworks/kactivities-${KFMIN}:5
@@ -96,7 +96,7 @@ RESTRICT+=" test"
 src_prepare() {
 	ecm_src_prepare
 	use multimedia || eapply "${FILESDIR}/${PN}-5.16.80-gstreamer-optional.patch"
-	use lowlatency && eapply "${FILESDIR}/${PN}-lowlatency-5.18.4-3.patch"
+	use lowlatency && eapply "${FILESDIR}/${PN}-lowlatency-5.18.5.patch"
 
 	# Access violations, bug #640432
 	sed -e "s/^ecm_find_qmlmodule.*QtMultimedia/#&/" \
