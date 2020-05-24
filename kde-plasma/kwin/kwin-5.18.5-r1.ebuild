@@ -15,7 +15,7 @@ DESCRIPTION="Flexible, composited Window Manager for windowing systems on Linux"
 
 LICENSE="GPL-2+"
 SLOT="5"
-KEYWORDS="~amd64 ~arm ~arm64 ~ppc64 ~x86"
+KEYWORDS="amd64 ~arm arm64 ~ppc64 x86"
 IUSE="caps gles2-only lowlatency multimedia"
 
 COMMON_DEPEND="
@@ -93,10 +93,17 @@ PDEPEND="
 
 RESTRICT+=" test"
 
+PATCHES=(
+	# in Plasma/5.18
+	# kwin-lowlatency upstream provides these as of 5.18.5-2
+	#"${FILESDIR}/${P}-dont-exec-QDialog.patch" # KDE-bug 421053
+	#"${FILESDIR}/${P}-wayland-lockscreen-greeter.patch" # KDE-bug 420802
+)
+
 src_prepare() {
 	ecm_src_prepare
 	use multimedia || eapply "${FILESDIR}/${PN}-5.16.80-gstreamer-optional.patch"
-	use lowlatency && eapply "${FILESDIR}/${PN}-lowlatency-5.18.5.patch"
+	use lowlatency && eapply "${FILESDIR}/${PN}-lowlatency-5.18.5-2.patch"
 
 	# Access violations, bug #640432
 	sed -e "s/^ecm_find_qmlmodule.*QtMultimedia/#&/" \
