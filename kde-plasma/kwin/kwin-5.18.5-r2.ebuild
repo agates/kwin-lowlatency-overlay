@@ -103,7 +103,7 @@ PATCHES=(
 src_prepare() {
 	ecm_src_prepare
 	use multimedia || eapply "${FILESDIR}/${PN}-5.16.80-gstreamer-optional.patch"
-	use lowlatency && eapply "${FILESDIR}/${PN}-lowlatency-5.18.5-2.patch"
+	use lowlatency && eapply "${FILESDIR}/${PN}-lowlatency-5.18.5-3.patch"
 
 	# Access violations, bug #640432
 	sed -e "s/^ecm_find_qmlmodule.*QtMultimedia/#&/" \
