@@ -5,7 +5,7 @@ EAPI=7
 
 ECM_HANDBOOK="optional"
 ECM_TEST="optional"
-KFMIN=5.70.0
+KFMIN=5.71.0
 PVCUT=$(ver_cut 1-3)
 QTMIN=5.14.2
 VIRTUALX_REQUIRED="test"
@@ -15,7 +15,7 @@ DESCRIPTION="Flexible, composited Window Manager for windowing systems on Linux"
 
 LICENSE="GPL-2+"
 SLOT="5"
-KEYWORDS="~amd64 ~arm64 ~ppc64"
+KEYWORDS="~amd64 ~arm64 ~ppc64 ~x86"
 IUSE="caps gles2-only lowlatency multimedia"
 
 COMMON_DEPEND="
@@ -96,7 +96,7 @@ PDEPEND="
 RESTRICT+=" test"
 
 src_prepare() {
-	use lowlatency && eapply "${FILESDIR}/${PN}-lowlatency-5.19.1.patch"
+	use lowlatency && eapply "${FILESDIR}/${PN}-lowlatency-5.19.2.patch"
 	ecm_src_prepare
 	use multimedia || eapply "${FILESDIR}/${PN}-5.16.80-gstreamer-optional.patch"
 
