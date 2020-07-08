@@ -96,7 +96,7 @@ PDEPEND="
 RESTRICT+=" test"
 
 src_prepare() {
-	use lowlatency && eapply "${FILESDIR}/${PN}-lowlatency-5.19.2.patch"
+	use lowlatency && eapply "${FILESDIR}/${PN}-lowlatency-5.19.3.patch"
 	ecm_src_prepare
 	use multimedia || eapply "${FILESDIR}/${PN}-5.16.80-gstreamer-optional.patch"
 
