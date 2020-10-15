@@ -96,7 +96,8 @@ PDEPEND="
 RESTRICT+=" test"
 
 PATCHES=(
-	"${FILESDIR}"/${P}-safe-removal-of-X11-event-filters.patch # KDE-Bug 423319
+	# Included in kwin-lowlatency v5.19.5-3
+	#"${FILESDIR}"/${P}-safe-removal-of-X11-event-filters.patch # KDE-Bug 423319
 )
 
 src_prepare() {
