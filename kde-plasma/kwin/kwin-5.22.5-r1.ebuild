@@ -5,11 +5,11 @@ EAPI=7
 
 ECM_HANDBOOK="optional"
 ECM_TEST="optional"
-KFMIN=5.74.0
+KFMIN=5.82.0
 PVCUT=$(ver_cut 1-3)
-QTMIN=5.15.1
+QTMIN=5.15.2
 VIRTUALX_REQUIRED="test"
-inherit ecm kde.org
+inherit ecm kde.org optfeature
 
 DESCRIPTION="Flexible, composited Window Manager for windowing systems on Linux"
 
@@ -86,12 +86,20 @@ RDEPEND="${COMMON_DEPEND}
 	>=dev-qt/qtvirtualkeyboard-${QTMIN}:5
 	>=kde-frameworks/kirigami-${KFMIN}:5
 	>=kde-frameworks/kitemmodels-${KFMIN}:5[qml]
+	|| (
+		x11-base/xwayland
+		x11-base/xorg-server[wayland(-)]
+	)
 	multimedia? ( >=dev-qt/qtmultimedia-${QTMIN}:5[gstreamer,qml] )
 "
 DEPEND="${COMMON_DEPEND}
 	>=dev-qt/designer-${QTMIN}:5
 	>=dev-qt/qtconcurrent-${QTMIN}:5
 	x11-base/xorg-proto
+	test? (
+		>=dev-libs/wayland-protocols-1.19
+		>=dev-qt/qtwayland-${QTMIN}:5
+	)
 "
 PDEPEND="
 	>=kde-plasma/kde-cli-tools-${PVCUT}:5
@@ -128,6 +136,8 @@ src_configure() {
 
 pkg_postinst() {
 	ecm_pkg_postinst
+	optfeature "color management support" x11-misc/colord
+	elog
 	elog "In Plasma 5.20, default behavior of the Task Switcher to move minimised"
 	elog "windows to the end of the list was changed so that it remains in the"
 	elog "original order. To revert to the well established behavior:"
