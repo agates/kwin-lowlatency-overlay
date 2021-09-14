@@ -107,14 +107,9 @@ PDEPEND="
 
 src_prepare() {
 	if use lowlatency; then
-		eapply "${FILESDIR}/${PN}-lowlatency-5.20.5.patch"
-		# these patches don't apply cleanly when lowlatency is used, so we need slighly different ones
-		eapply "${FILESDIR}/${PN}-lowlatency-5.20.5-revert-new-focuschain-w-minimised.patch" # KDE-Bug 427840
-		eapply "${FILESDIR}/${PN}-lowlatency-5.20.5-keep-focuschain-behavior-w-minimised.patch" # Plasma/5.21
-	else
-		eapply "${FILESDIR}/${P}-revert-new-focuschain-w-minimised.patch" # KDE-Bug 427840
-		eapply "${FILESDIR}/${P}-keep-focuschain-behavior-w-minimised.patch" # Plasma/5.21
+		eapply "${FILESDIR}/${PN}-5.21-unredirect.patch"
 	fi
+	
 	ecm_src_prepare
 	use multimedia || eapply "${FILESDIR}/${PN}-5.16.80-gstreamer-optional.patch"
 
