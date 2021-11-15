@@ -9,8 +9,8 @@ Subject: [PATCH] Disable the effect video button if gstreamer is missing
 
 diff --git a/kcmkwin/kwineffects/package/contents/ui/Effect.qml b/kcmkwin/kwineffects/package/contents/ui/Effect.qml
 index 71dbc5935..86ddf40b3 100644
---- a/kcmkwin/kwineffects/package/contents/ui/Effect.qml
-+++ b/kcmkwin/kwineffects/package/contents/ui/Effect.qml
+--- a/src/kcmkwin/kwineffects/package/contents/ui/Effect.qml
++++ b/src/kcmkwin/kwineffects/package/contents/ui/Effect.qml
 @@ -112,7 +112,7 @@ Kirigami.SwipeListItem {
      }
      actions: [
@@ -22,3 +22,4 @@ index 71dbc5935..86ddf40b3 100644
              onTriggered: videoItem.showHide()
 -- 
 2.22.0
+

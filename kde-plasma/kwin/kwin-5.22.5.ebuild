@@ -1,7 +1,7 @@
 # Copyright 1999-2021 Gentoo Authors
 # Distributed under the terms of the GNU General Public License v2
 
-EAPI=7
+EAPI=8
 
 ECM_HANDBOOK="optional"
 ECM_TEST="optional"
@@ -15,19 +15,17 @@ DESCRIPTION="Flexible, composited Window Manager for windowing systems on Linux"
 
 LICENSE="GPL-2+"
 SLOT="5"
-KEYWORDS="amd64 ~arm arm64 ~ppc64 x86"
-IUSE="accessibility caps gles2-only lowlatency multimedia screencast"
+KEYWORDS="amd64 ~arm arm64 ~ppc64 ~riscv x86"
+IUSE="accessibility caps gles2-only lowlatency multimedia plasma screencast"
 
-RESTRICT+=" test"
+RESTRICT="test"
 
 COMMON_DEPEND="
 	>=dev-libs/libinput-1.14
 	>=dev-libs/wayland-1.2
 	>=dev-qt/qtdbus-${QTMIN}:5
 	>=dev-qt/qtdeclarative-${QTMIN}:5
-	>=dev-qt/qtgui-${QTMIN}:5=[gles2-only=]
-	>=dev-qt/qtscript-${QTMIN}:5
-	>=dev-qt/qtsensors-${QTMIN}:5
+	>=dev-qt/qtgui-${QTMIN}:5=[gles2-only=,libinput]
 	>=dev-qt/qtwidgets-${QTMIN}:5
 	>=dev-qt/qtx11extras-${QTMIN}:5
 	>=kde-frameworks/kactivities-${KFMIN}:5
@@ -60,11 +58,10 @@ COMMON_DEPEND="
 	>=kde-plasma/kwayland-server-${PVCUT}:5
 	media-libs/fontconfig
 	media-libs/freetype
+	media-libs/lcms:2
 	media-libs/libepoxy
-	media-libs/mesa[egl,gbm,wayland,X(+)]
+	media-libs/mesa[egl(+),gbm(+),wayland,X(+)]
 	virtual/libudev:=
-	x11-libs/libICE
-	x11-libs/libSM
 	x11-libs/libX11
 	x11-libs/libXi
 	x11-libs/libdrm
@@ -77,6 +74,7 @@ COMMON_DEPEND="
 	accessibility? ( media-libs/libqaccessibilityclient:5 )
 	caps? ( sys-libs/libcap )
 	gles2-only? ( media-libs/mesa[gles2] )
+	plasma? ( >=kde-frameworks/krunner-${KFMIN}:5 )
 	screencast? ( >=media-video/pipewire-0.3:= )
 "
 # TODO: sys-apps/hwdata? not packaged yet; commit 33a1777a, Gentoo-bug 717216
@@ -107,11 +105,12 @@ PDEPEND="
 
 src_prepare() {
 	if use lowlatency; then
-		eapply "${FILESDIR}/${PN}-5.21-unredirect.patch"
+		# TODO: patch needs to be mirrored from source to address Repoman's `patch.size` error
+		eapply "${FILESDIR}/${P}-unredirection.patch"
 	fi
-	
+
 	ecm_src_prepare
-	use multimedia || eapply "${FILESDIR}/${PN}-5.16.80-gstreamer-optional.patch"
+	use multimedia || eapply "${FILESDIR}/${PN}-5.21.80-gstreamer-optional.patch"
 
 	# TODO: try to get a build switch upstreamed
 	if ! use screencast; then
@@ -124,6 +123,7 @@ src_configure() {
 	local mycmakeargs=(
 		$(cmake_use_find_package accessibility QAccessibilityClient)
 		$(cmake_use_find_package caps Libcap)
+		$(cmake_use_find_package plasma KF5Runner)
 	)
 
 	ecm_src_configure
